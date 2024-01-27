@@ -128,7 +128,7 @@ class RankDETR(nn.Module):
         num_pred = (
             (transformer.decoder.num_layers + 1) if as_two_stage else transformer.decoder.num_layers
         )
-        if with_box_refine:
+        if with_box_refine: # heads for different decoder layers do not share parameters
             self.class_embed = nn.ModuleList(
                 [copy.deepcopy(self.class_embed) for i in range(num_pred)]
             )
@@ -173,7 +173,7 @@ class RankDETR(nn.Module):
                 nn.init.zeros_(m)
 
     def forward(self, batched_inputs):
-        images = self.preprocess_image(batched_inputs)
+        images = self.preprocess_image(batched_inputs) # shape (4,3,H,W)
 
         if self.training:
             batch_size, _, H, W = images.tensor.shape
@@ -195,9 +195,9 @@ class RankDETR(nn.Module):
         # original features
         features = self.backbone(images.tensor)  # output feature dict
 
-        # project backbone features to the reuired dimension of transformer
+        # project backbone features to the required dimension of transformer
         # we use multi-scale features in deformable DETR
-        multi_level_feats = self.neck(features)
+        multi_level_feats = self.neck(features) # for each level, feat now has the same num of channels.
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -212,7 +212,10 @@ class RankDETR(nn.Module):
             query_embeds = self.query_embedding.weight[0 : self.num_queries, :]
 
         # make attn mask
-        """ attention mask to prevent information leakage
+        """ 
+        attention mask to prevent information leakage: the attention calculation for 
+        one-to-one query and one-to-many query should be disentangled.
+
         """
         self_attn_mask = (
             torch.zeros(

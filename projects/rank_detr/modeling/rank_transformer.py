@@ -219,7 +219,7 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
             # query rank layer
             if layer_idx >= 1:
                 if self.query_rank_layer:
-                    output = torch.gather(
+                    output = torch.gather( # rank-aware content query
                         output, 1, rank_indices.unsqueeze(-1).repeat(1, 1, output.shape[-1])
                     )
                     concat_term = self.pre_racq_trans[layer_idx - 1](
@@ -227,7 +227,7 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                     )
                     output = torch.cat((output, concat_term), dim=2)
                     output = self.post_racq_trans[layer_idx - 1](output)
-                    query_pos = torch.gather(
+                    query_pos = torch.gather( # rank-aware pos query
                         query_pos, 1, rank_indices.unsqueeze(-1).repeat(1, 1, query_pos.shape[-1])
                     )
                 if (not self.query_rank_layer) and (self.rank_adaptive_classhead):
@@ -239,9 +239,9 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                     )
 
             if reference_points.shape[-1] == 4:
-                reference_points_input = (
-                    reference_points[:, :, None]
-                    * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
+                reference_points_input = ( # one-to-one queries + one-to-many queries == 1800
+                    reference_points[:, :, None] # (bs, 1800, 1, 4) * (bs, 1, num_lvl, 4)
+                    * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # (bs, 1800, num_lvl, 4)
                 )
             else:
                 assert reference_points.shape[-1] == 2
@@ -270,7 +270,7 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                     new_reference_points = tmp
                     new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
-                reference_points = new_reference_points.detach()
+                reference_points = new_reference_points.detach() # NOTE gradient detached
 
             if self.return_intermediate:
 
@@ -290,16 +290,16 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                         ) # tensor shape: [bs, num_queries_one2one+num_queries_one2many]
                     else:
                         rank_indices = torch.argsort(rank_basis[:, : self.num_queries_one2one], dim=1, descending=True)
-                    rank_indices = rank_indices.detach()
+                    rank_indices = rank_indices.detach() # NOTE detach
                     # rank the reference points
-                    reference_points = torch.gather(
+                    reference_points = torch.gather( # (bs, num_queries, 1) -> (bs, num_queries, 4)
                         reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, reference_points.shape[-1]))
                     new_reference_points = torch.gather(
                         new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
 
                 intermediate.append(output)
-                intermediate_reference_points.append(
-                    new_reference_points if self.look_forward_twice else reference_points
+                intermediate_reference_points.append( # reference_points now is the gradient detached form of new_reference points.
+                    new_reference_points if self.look_forward_twice else reference_points # TODO look forward twice? Refer to DINO sec3.5.
                 )
 
         if self.return_intermediate:
@@ -368,32 +368,33 @@ class RankDetrTransformer(nn.Module):
         nn.init.normal_(self.level_embeds)
 
     def gen_encoder_output_proposals(self, memory, memory_padding_mask, spatial_shapes):
-        N, S, C = memory.shape
+        N, S, C = memory.shape # batchsize, all_lvl_loc_num, feat_channel
         proposals = []
-        _cur = 0
+        _cur = 0                      
+
         for lvl, (H, W) in enumerate(spatial_shapes):
             mask_flatten_ = memory_padding_mask[:, _cur : (_cur + H * W)].view(N, H, W, 1)
-            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
-            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
+            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1) # (N, H) -> (N, )
+            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1) # (N, W) -> (N, )
 
-            grid_y, grid_x = torch.meshgrid(
+            grid_y, grid_x = torch.meshgrid( # (H, W)
                 torch.linspace(0, H - 1, H, dtype=torch.float32, device=memory.device),
                 torch.linspace(0, W - 1, W, dtype=torch.float32, device=memory.device),
             )
-            grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
+            grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1) # 2*(H, W) -> (H,W,2)
 
-            scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N, 1, 1, 2)
-            grid = (grid.unsqueeze(0).expand(N, -1, -1, -1) + 0.5) / scale
-            wh = torch.ones_like(grid) * 0.05 * (2.0**lvl)
-            proposal = torch.cat((grid, wh), -1).view(N, -1, 4)
+            scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N, 1, 1, 2) # (N, 1, 1, 2)
+            grid = (grid.unsqueeze(0).expand(N, -1, -1, -1) + 0.5) / scale # (1, H, W, 2) -> (N, H, W, 2) 
+            wh = torch.ones_like(grid) * 0.05 * (2.0**lvl) # Appendix A.4 in deformable-detr
+            proposal = torch.cat((grid, wh), -1).view(N, -1, 4) # proposal representation: normalized (c_x, c_y, w, h)
             proposals.append(proposal)
             _cur += H * W
 
-        output_proposals = torch.cat(proposals, 1)
+        output_proposals = torch.cat(proposals, 1) # (bs, all_lvl_loc_num,4)
         output_proposals_valid = ((output_proposals > 0.01) & (output_proposals < 0.99)).all(
-            -1, keepdim=True
+            -1, keepdim=True # (bs, all_lvl_loc_num,1)
         )
-        output_proposals = torch.log(output_proposals / (1 - output_proposals))
+        output_proposals = torch.log(output_proposals / (1 - output_proposals)) # inverse sigmoid
         output_proposals = output_proposals.masked_fill(
             memory_padding_mask.unsqueeze(-1), float("inf")
         )
@@ -429,12 +430,12 @@ class RankDetrTransformer(nn.Module):
                 torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
                 torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
             )
-            ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
+            ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H) # (1, h*w) / (bs, 1) -> (bs, h*w)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
-            ref = torch.stack((ref_x, ref_y), -1)
+            ref = torch.stack((ref_x, ref_y), -1) # (bs, h*w, 2)
             reference_points_list.append(ref)
         reference_points = torch.cat(reference_points_list, 1)
-        reference_points = reference_points[:, :, None] * valid_ratios[:, None]
+        reference_points = reference_points[:, :, None] * valid_ratios[:, None] # (bs,all_lvl_num, 1, 2) * (bs, 1, num_lvl, 2)
         return reference_points
 
     def get_valid_ratio(self, mask):
@@ -456,7 +457,7 @@ class RankDetrTransformer(nn.Module):
         proposals = proposals.sigmoid() * scale
         # N, L, 4, 128
         pos = proposals[:, :, :, None] / dim_t
-        # N, L, 4, 64, 2
+        # N, L, 4, 64, 2 -> N, L, 512
         pos = torch.stack((pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()), dim=4).flatten(2)
         return pos
 
@@ -483,9 +484,9 @@ class RankDetrTransformer(nn.Module):
             spatial_shapes.append(spatial_shape)
 
             feat = feat.flatten(2).transpose(1, 2)  # bs, hw, c
-            mask = mask.flatten(1)
+            mask = mask.flatten(1) # bs, hw
             pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
-            lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1)
+            lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1) # level_embed to distinguish levels?
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             feat_flatten.append(feat)
             mask_flatten.append(mask)
@@ -493,14 +494,14 @@ class RankDetrTransformer(nn.Module):
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(
-            spatial_shapes, dtype=torch.long, device=feat_flatten.device
+            spatial_shapes, dtype=torch.long, device=feat_flatten.device # featuer map shape
         )
         level_start_index = torch.cat(
             (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
         )
-        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        reference_points = self.get_reference_points(
+        reference_points = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
@@ -523,28 +524,28 @@ class RankDetrTransformer(nn.Module):
                 memory, mask_flatten, spatial_shapes
             )
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory) # apply linear layer, (bs, all_loc, num_class)
             enc_outputs_coord_unact = (
-                self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+                self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals # apply mlp 
             )
 
-            topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
-            topk_coords_unact = torch.gather(
+            topk = self.two_stage_num_proposals #1800. NOTE it is same as the number of decoder queries
+            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1] # get the indexes. TODO why not max? cuz it's intended as a binary classifier.
+            topk_coords_unact = torch.gather( # all proposals (bs, all_loc, 4) & indexes (bs, num_proposals) -> (bs, num_proposals, 4)
                 enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
             )
-            topk_coords_unact = topk_coords_unact.detach()
+            topk_coords_unact = topk_coords_unact.detach() # NOTE gradient detached
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(
-                self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact))
+                self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)) # (bs, num_proposals, 512)
             )
-            if not self.mixed_selection:
+            if not self.mixed_selection: # refer to DINO mixed query selection.
                 query_pos, query = torch.split(pos_trans_out, c, dim=2)
             else:
                 # query_pos here is the content embed for deformable DETR
-                query = query_embed.unsqueeze(0).expand(bs, -1, -1)
-                query_pos, _ = torch.split(pos_trans_out, c, dim=2)
+                query = query_embed.unsqueeze(0).expand(bs, -1, -1) # (bs, num_proposals, 256)
+                query_pos, _ = torch.split(pos_trans_out, c, dim=2) # proposal (x,y,w,h) . we only need x,y info. (bs, num_proposals, 512) -> 2 * (bs, num_proposals, 256)
         else:
             query_pos, query = torch.split(query_embed, c, dim=1)
             query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
