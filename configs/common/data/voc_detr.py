@@ -7,7 +7,7 @@ from detectron2.data import (
     build_detection_train_loader,
     get_detection_dataset_dicts,
 )
-from detectron2.evaluation import PascalVOCDetectionEvaluator
+from detectron2.evaluation import PascalVOCDetectionEvaluator, COCOEvaluator
 
 from detrex.data import DetrDatasetMapper
 
@@ -65,6 +65,6 @@ dataloader.test = L(build_detection_test_loader)(
     num_workers=4,
 )
 
-dataloader.evaluator = L(PascalVOCDetectionEvaluator)(
+dataloader.evaluator = L(COCOEvaluator)(
     dataset_name="${..test.dataset.names}",
 )
