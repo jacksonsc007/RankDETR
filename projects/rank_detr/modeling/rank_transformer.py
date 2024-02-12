@@ -349,11 +349,15 @@ class RankDetrTransformer(nn.Module):
             self.pos_trans = nn.Linear(self.embed_dim * 2, self.embed_dim * 2)
             self.pos_trans_norm = nn.LayerNorm(self.embed_dim * 2)
         else:
-            self.reference_points = nn.Linear(self.embed_dim, 2)
+            self.reference_points_trans = nn.Linear(self.embed_dim, 2)
 
         self.mixed_selection = mixed_selection
 
         self.init_weights()
+
+        assert self.encoder.num_layers == self.decoder.num_layers, \
+        "symmetric encoder decoders design is now required."
+        self.num_stages = self.encoder.num_layers
 
     def init_weights(self):
         for p in self.parameters():
@@ -501,80 +505,303 @@ class RankDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        reference_points = self.get_reference_points( # TODO why twice ratio?
+        encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
-        memory = self.encoder(
-            query=feat_flatten,
-            key=None,
-            value=None,
-            query_pos=lvl_pos_embed_flatten,
-            query_key_padding_mask=mask_flatten,
+
+        memory = feat_flatten # init memory
+        decoder_query = None
+        decoder_query_pos = None
+        decoder_reference_points = None
+        rank_indices = None
+
+        inter_states = []
+        inter_references = []
+        init_reference_outs = []
+        enc_outputs_class_all = []
+        enc_outputs_coord_unact_all = []
+        for stage_id in range(self.num_stages):
+            memory, decoder_query, decoder_query_pos,\
+            rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
+            enc_outputs_class, enc_outputs_coord_unact = \
+                self.cascade_stage(
+                    stage_id=stage_id,
+                    encoder_query=memory,
+                    encoder_key=None,
+                    encoder_value=None,
+                    encoder_query_pos=lvl_pos_embed_flatten,
+                    encoder_attn_masks = None,
+                    encoder_reference_points=encoder_reference_points,
+                    query_key_padding_mask=mask_flatten,
+                    decoder_query=decoder_query,
+                    decoder_query_pos=decoder_query_pos,
+                    decoder_query_embed=query_embed,
+                    decoder_reference_points=decoder_reference_points,
+                    decoder_attn_masks = [self_attn_mask, None],
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    valid_ratios=valid_ratios,
+                    rank_indices=rank_indices,
+                    **kwargs
+            )
+
+            # assert decoder_reference_points.requires_grad == False
+            inter_states.append(decoder_query)
+            inter_references.append( new_reference_points if self.decoder.look_forward_twice else decoder_reference_points)
+            init_reference_outs.append(init_reference_out)
+            enc_outputs_class_all.append(enc_outputs_class)
+            enc_outputs_coord_unact_all.append(enc_outputs_coord_unact)
+
+        if self.decoder.return_intermediate:
+            inter_states = torch.stack(inter_states)
+            inter_references = torch.stack(inter_references)
+        else:
+            inter_states = decoder_query
+            inter_references = decoder_reference_points
+        inter_references_out = inter_references
+        if self.as_two_stage:
+            return (
+                inter_states,
+                init_reference_outs[0],
+                inter_references_out,
+                enc_outputs_class_all[0],
+                enc_outputs_coord_unact_all[0],
+            )
+        return inter_states, init_reference_outs[0], inter_references_out, None, None
+
+    def cascade_stage(
+        self,
+        stage_id,
+        encoder_query,
+        encoder_key,
+        encoder_value,
+        encoder_query_pos,
+        encoder_attn_masks,
+        encoder_reference_points,
+        query_key_padding_mask,
+        decoder_query,
+        decoder_query_pos,
+        decoder_query_embed,
+        decoder_reference_points,
+        decoder_attn_masks,
+        spatial_shapes,
+        level_start_index,
+        valid_ratios,
+        rank_indices,
+        **kwargs
+    ):
+        memory = self.cascade_stage_encoder_part(
+            stage_id,
+            query=encoder_query,
+            key=encoder_key,
+            value=encoder_value,
+            query_pos=encoder_query_pos,
+            attn_masks=encoder_attn_masks,
+            query_key_padding_mask=query_key_padding_mask,
             spatial_shapes=spatial_shapes,
-            reference_points=reference_points,
+            reference_points=encoder_reference_points,
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
             **kwargs,
         )
 
-        bs, _, c = memory.shape
-        if self.as_two_stage:
-            output_memory, output_proposals = self.gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes
-            )
+        init_reference_out = None
+        enc_outputs_class = None
+        enc_outputs_coord_unact = None
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory) # apply linear layer, (bs, all_loc, num_class)
-            enc_outputs_coord_unact = (
-                self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals # apply mlp 
-            )
+        # generate initial query for decoder 
+        if stage_id == 0: 
+            bs, _, c = memory.shape
+            if self.as_two_stage:
+                output_memory, output_proposals = self.gen_encoder_output_proposals(
+                    memory, query_key_padding_mask, spatial_shapes
+                )
 
-            topk = self.two_stage_num_proposals #1800. NOTE it is same as the number of decoder queries
-            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1] # get the indexes. TODO why not max? cuz it's intended as a binary classifier.
-            topk_coords_unact = torch.gather( # all proposals (bs, all_loc, 4) & indexes (bs, num_proposals) -> (bs, num_proposals, 4)
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            )
-            topk_coords_unact = topk_coords_unact.detach() # NOTE gradient detached
-            reference_points = topk_coords_unact.sigmoid()
-            init_reference_out = reference_points
-            pos_trans_out = self.pos_trans_norm(
-                self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)) # (bs, num_proposals, 512)
-            )
-            if not self.mixed_selection: # refer to DINO mixed query selection.
-                query_pos, query = torch.split(pos_trans_out, c, dim=2)
+                enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+                enc_outputs_coord_unact = (
+                    self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+                )
+
+                topk = self.two_stage_num_proposals
+                topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
+                topk_coords_unact = torch.gather(
+                    enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+                )
+                topk_coords_unact = topk_coords_unact.detach()
+                decoder_reference_points = topk_coords_unact.sigmoid()
+                init_reference_out = decoder_reference_points
+                pos_trans_out = self.pos_trans_norm(
+                    self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact))
+                )
+                if not self.mixed_selection:
+                    decoder_query_pos, decoder_query = torch.split(pos_trans_out, c, dim=2)
+                else:
+                    # decoder_query_pos here is the content embed for deformable DETR
+                    decoder_query = decoder_query_embed.unsqueeze(0).expand(bs, -1, -1)
+                    decoder_query_pos, _ = torch.split(pos_trans_out, c, dim=2)
             else:
-                # query_pos here is the content embed for deformable DETR
-                query = query_embed.unsqueeze(0).expand(bs, -1, -1) # (bs, num_proposals, 256)
-                query_pos, _ = torch.split(pos_trans_out, c, dim=2) # proposal (x,y,w,h) . we only need x,y info. (bs, num_proposals, 512) -> 2 * (bs, num_proposals, 256)
-        else:
-            query_pos, query = torch.split(query_embed, c, dim=1)
-            query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-            query = query.unsqueeze(0).expand(bs, -1, -1)
-            reference_points = self.reference_points(query_pos).sigmoid()
-            init_reference_out = reference_points
+                decoder_query_pos, decoder_query = torch.split(decoder_query_embed, c, dim=1)
+                decoder_query_pos = decoder_query_pos.unsqueeze(0).expand(bs, -1, -1)
+                decoder_query = decoder_query.unsqueeze(0).expand(bs, -1, -1)
+                decoder_reference_points = self.reference_points_trans(decoder_query_pos).sigmoid()
+                init_reference_out = decoder_reference_points
 
-        # decoder
-        inter_states, inter_references = self.decoder(
-            query=query,  # bs, num_queries, embed_dims
-            key=None,  # bs, num_tokens, embed_dims
-            value=memory,  # bs, num_tokens, embed_dims
+
+        decoder_query, decoder_query_pos, rank_indices, \
+            decoder_reference_points, new_reference_points =  \
+                self.cascade_stage_decoder_part(
+                    stage_id,
+                    query=decoder_query,  # bs, num_queries, embed_dims
+                    key=None,  # bs, num_tokens, embed_dims
+                    value=memory,  # bs, num_tokens, embed_dims
+                    query_pos=decoder_query_pos,
+                    key_padding_mask=query_key_padding_mask,  # bs, num_tokens
+                    reference_points=decoder_reference_points,  # num_queries, 4
+                    spatial_shapes=spatial_shapes,  # nlvl, 2
+                    level_start_index=level_start_index,  # nlvl
+                    valid_ratios=valid_ratios,  # bs, nlvl, 2
+                    attn_masks=decoder_attn_masks,
+                    rank_indices=rank_indices,
+                    **kwargs,
+        )
+
+
+
+        return ( memory, decoder_query, decoder_query_pos, rank_indices, \
+                 decoder_reference_points, new_reference_points, init_reference_out,\
+                 enc_outputs_class, enc_outputs_coord_unact)
+    
+    def cascade_stage_decoder_part(
+        self,
+        stage_id,
+        query,
+        key,
+        value,
+        query_pos=None,
+        key_pos=None,
+        attn_masks=None,
+        query_key_padding_mask=None,
+        key_padding_mask=None,
+        reference_points=None,
+        valid_ratios=None,
+        rank_indices=None,
+        **kwargs,
+    ):
+        output = query
+
+        # query rank layer
+        if stage_id >= 1:
+            assert rank_indices is not None
+            if self.decoder.query_rank_layer:
+                output = torch.gather(
+                    output, 1, rank_indices.unsqueeze(-1).repeat(1, 1, output.shape[-1])
+                )
+                concat_term = self.decoder.pre_racq_trans[stage_id - 1](
+                    self.decoder.rank_aware_content_query[stage_id - 1].weight[:output.shape[1]].unsqueeze(0).expand(output.shape[0], -1, -1)
+                )
+                output = torch.cat((output, concat_term), dim=2)
+                output = self.decoder.post_racq_trans[stage_id - 1](output)
+                query_pos = torch.gather(
+                    query_pos, 1, rank_indices.unsqueeze(-1).repeat(1, 1, query_pos.shape[-1])
+                )
+            if (not self.decoder.query_rank_layer) and (self.decoder.rank_adaptive_classhead):
+                output = torch.gather(
+                    output, 1, rank_indices.unsqueeze(-1).repeat(1, 1, output.shape[-1])
+                )
+                query_pos = torch.gather(
+                    query_pos, 1, rank_indices.unsqueeze(-1).repeat(1, 1, query_pos.shape[-1])
+                )
+
+        if reference_points.shape[-1] == 4:
+            reference_points_input = (
+                reference_points[:, :, None]
+                * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
+            )
+        else:
+            assert reference_points.shape[-1] == 2
+            reference_points_input = reference_points[:, :, None] * valid_ratios[:, None] 
+
+        layer = self.decoder.layers[stage_id]
+        output = layer(
+            output,
+            key,
+            value,
             query_pos=query_pos,
-            key_padding_mask=mask_flatten,  # bs, num_tokens
-            reference_points=reference_points,  # num_queries, 4
-            spatial_shapes=spatial_shapes,  # nlvl, 2
-            level_start_index=level_start_index,  # nlvl
-            valid_ratios=valid_ratios,  # bs, nlvl, 2
-            attn_masks=[self_attn_mask, None],
+            key_pos=key_pos,
+            attn_masks=attn_masks,
+            query_key_padding_mask=query_key_padding_mask,
+            key_padding_mask=key_padding_mask,
+            reference_points=reference_points_input,
             **kwargs,
         )
 
-        inter_references_out = inter_references
-        if self.as_two_stage:
-            return (
-                inter_states,
-                init_reference_out,
-                inter_references_out,
-                enc_outputs_class,
-                enc_outputs_coord_unact,
-            )
-        return inter_states, init_reference_out, inter_references_out, None, None
+        if self.decoder.bbox_embed is not None:
+            tmp = self.decoder.bbox_embed[stage_id](output)
+            if reference_points.shape[-1] == 4:
+                new_reference_points = tmp + inverse_sigmoid(reference_points)
+                new_reference_points = new_reference_points.sigmoid()
+            else:
+                assert reference_points.shape[-1] == 2
+                new_reference_points = tmp
+                new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
+                new_reference_points = new_reference_points.sigmoid()
+            reference_points = new_reference_points.detach()
+
+        if self.decoder.return_intermediate:
+
+            if (stage_id >= 0) and (self.decoder.query_rank_layer or self.decoder.rank_adaptive_classhead):
+                # generate rank indices
+                outputs_class_tmp = self.decoder.class_embed[stage_id](output)  # [bs, num_queries, embed_dim] -> [bs, num_queries, num_classes]
+                rank_basis = outputs_class_tmp.sigmoid().max(dim=2, keepdim=False)[0] # tensor shape: [bs, num_queries]
+                if self.decoder.training:
+                    rank_indices_one2one  = torch.argsort(rank_basis[:, : self.decoder.num_queries_one2one], dim=1, descending=True) # tensor shape: [bs, num_queries_one2one]
+                    rank_indices_one2many = torch.argsort(rank_basis[:, self.decoder.num_queries_one2one :], dim=1, descending=True) # tensor shape: [bs, num_queries_one2many]
+                    rank_indices = torch.cat(
+                        (
+                            rank_indices_one2one,
+                            rank_indices_one2many + torch.ones_like(rank_indices_one2many) * self.decoder.num_queries_one2one
+                        ),
+                        dim=1,
+                    ) # tensor shape: [bs, num_queries_one2one+num_queries_one2many]
+                else:
+                    rank_indices = torch.argsort(rank_basis[:, : self.decoder.num_queries_one2one], dim=1, descending=True)
+                rank_indices = rank_indices.detach()
+                # rank the reference points
+                reference_points = torch.gather(
+                    reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, reference_points.shape[-1]))
+                new_reference_points = torch.gather(
+                    new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
+        
+        return output, query_pos, rank_indices, reference_points, new_reference_points
+
+        
+    def cascade_stage_encoder_part(
+        self,
+        stage_id,
+        query,
+        key,
+        value,
+        query_pos=None,
+        key_pos=None,
+        attn_masks=None,
+        query_key_padding_mask=None,
+        key_padding_mask=None,
+        **kwargs,
+    ):
+        encoder_layer = self.encoder.layers[stage_id] 
+        memory = encoder_layer(
+            query,
+            key,
+            value,
+            query_pos=query_pos,
+            attn_masks=attn_masks,
+            query_key_padding_mask=query_key_padding_mask,
+            key_padding_mask=key_padding_mask,
+            **kwargs, 
+        )
+        if stage_id == (self.num_stages - 1) and self.encoder.post_norm_layer is not None :
+            memory = self.encoder.post_norm_layer(memory)
+        return memory
+       
+        

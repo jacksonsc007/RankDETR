@@ -28,6 +28,21 @@ model.num_queries_one2one = 300
 model.num_queries_one2many = 1500
 model.transformer.two_stage_num_proposals = model.num_queries_one2one + model.num_queries_one2many
 
+# use single scale
+model.backbone.out_features=["res3",
+                             "res4"
+                            ]
+from detectron2.layers import ShapeSpec
+model.neck.input_shapes={ "res3": ShapeSpec(channels=512), 
+                          "res4":ShapeSpec(channels=1024)
+                        }
+model.neck.in_features=["res3", 
+                        "res4"
+                        ]
+model.neck.num_outs=2
+model.transformer.num_feature_levels=2
+
+
 #NOTE======================== modifications to train on voc =======================================
 train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
 train.output_dir = "./output/rank_detr_r50_two_stage_12ep"
@@ -41,5 +56,5 @@ train.checkpointer.period = 5000
 
 # wandb log
 train.wandb.enabled = True
-train.wandb.params.name = "rank_detr_voc_baseline"
+train.wandb.params.name = "rank_detr_voc_baseline_res3_res4"
 train.output_dir = "./output/" + "${train.wandb.params.name}"

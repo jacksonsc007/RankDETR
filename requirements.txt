@@ -1,6 +1,6 @@
 cloudpickle
 hydra-core
-omegaconf==2.1.0
+omegaconf==2.1.1
 pybind11
 flake8==3.8.1 
 isort==4.3.21
