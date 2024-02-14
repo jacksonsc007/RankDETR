@@ -37,7 +37,7 @@ model.criterion.num_classes = 20
 model.transformer.encoder.num_layers=3 
 model.transformer.decoder.num_layers=3 
 model.num_queries_one2one = 300
-model.num_queries_one2many = 1500
+model.num_queries_one2many = 1500 
 model.transformer.two_stage_num_proposals = model.num_queries_one2one + model.num_queries_one2many
 
 # two-stage scheme
@@ -49,8 +49,11 @@ model.criterion.GIoU_aware_class_loss = True
 model.criterion.matcher.iou_order_alpha = 4.0
 model.criterion.matcher.matcher_change_iter = 67500
 
+model.transformer.topk_ratio=0.05
 
-model_code = f"CascadeRankDETR_twostage_one2one{model.num_queries_one2one}one2many{model.num_queries_one2many}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}"
+
+
+model_code = f"CascadeRankDETR_twostage_one2one{model.num_queries_one2one}one2many{model.num_queries_one2many}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}_topkratio{model.transformer.topk_ratio}"
 
 # ========================================
 # optimizer config

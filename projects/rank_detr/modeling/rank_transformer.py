@@ -24,11 +24,14 @@ from detrex.layers import (
     MultiheadAttention,
     MultiScaleDeformableAttention,
     TransformerLayerSequence,
+    box_cxcywh_to_xyxy
 )
 from detrex.utils import inverse_sigmoid
 
+from detectron2.utils.events import get_event_storage
 from fairscale.nn.checkpoint import checkpoint_wrapper
 
+INK_INF = 1e20
 
 class RankDetrTransformerEncoder(TransformerLayerSequence):
     def __init__(
@@ -331,6 +334,7 @@ class RankDetrTransformer(nn.Module):
         two_stage_num_proposals=300,
         mixed_selection=True,
         rank_adaptive_classhead=True,
+        topk_ratio=0.5
     ):
         super(RankDetrTransformer, self).__init__()
         self.encoder = encoder
@@ -358,6 +362,8 @@ class RankDetrTransformer(nn.Module):
         assert self.encoder.num_layers == self.decoder.num_layers, \
         "symmetric encoder decoders design is now required."
         self.num_stages = self.encoder.num_layers
+
+        self.topk_ratio=topk_ratio
 
     def init_weights(self):
         for p in self.parameters():
@@ -472,6 +478,8 @@ class RankDetrTransformer(nn.Module):
         multi_level_pos_embeds,
         query_embed,
         self_attn_mask,
+        img_true_sizes,
+        img_batched_sizes,
         **kwargs,
     ):
         assert self.as_two_stage or query_embed is not None
@@ -480,18 +488,26 @@ class RankDetrTransformer(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
+        multi_lvl_feature_valid_size = []
         for lvl, (feat, mask, pos_embed) in enumerate(
             zip(multi_level_feats, multi_level_masks, multi_level_pos_embeds)
         ):
             bs, c, h, w = feat.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
+            valid_h = (~mask).cumsum(dim=1)[:, -1, 0]
+            valid_w = (~mask).cumsum(dim=2)[:, 0, -1]
+            valid_size = torch.stack([valid_h, valid_w], dim = -1)
+            multi_lvl_feature_valid_size.append(valid_size)
 
             feat = feat.flatten(2).transpose(1, 2)  # bs, hw, c
             mask = mask.flatten(1) # bs, hw
             pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
             lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1) # level_embed to distinguish levels?
             lvl_pos_embed_flatten.append(lvl_pos_embed)
+
+
+
             feat_flatten.append(feat)
             mask_flatten.append(mask)
         feat_flatten = torch.cat(feat_flatten, 1)
@@ -521,9 +537,11 @@ class RankDetrTransformer(nn.Module):
         init_reference_outs = []
         enc_outputs_class_all = []
         enc_outputs_coord_unact_all = []
+        # topk = int(self.num_queries * self.topk_ratio)
+        new_query_key_padding_mask = mask_flatten
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
-            rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
+            rank_indices, decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out, \
             enc_outputs_class, enc_outputs_coord_unact = \
                 self.cascade_stage(
                     stage_id=stage_id,
@@ -533,7 +551,7 @@ class RankDetrTransformer(nn.Module):
                     encoder_query_pos=lvl_pos_embed_flatten,
                     encoder_attn_masks = None,
                     encoder_reference_points=encoder_reference_points,
-                    query_key_padding_mask=mask_flatten,
+                    query_key_padding_mask=new_query_key_padding_mask,
                     decoder_query=decoder_query,
                     decoder_query_pos=decoder_query_pos,
                     decoder_query_embed=query_embed,
@@ -545,6 +563,24 @@ class RankDetrTransformer(nn.Module):
                     rank_indices=rank_indices,
                     **kwargs
             )
+            assert memory.isfinite().all()
+            
+            extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
+                                             img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
+
+            assert extra_masks.size() == mask_flatten.size()
+            new_query_key_padding_mask = ( extra_masks | mask_flatten )
+            # new_query_key_padding_mask = new_query_key_padding_mask.float().masked_fill(new_query_key_padding_mask, -INK_INF) 
+            padding_mask_ratio = ((~mask_flatten).int().sum() / mask_flatten.numel()).item()
+            decoder_mask_ratio = ((~extra_masks).int().sum() / extra_masks.numel()).item()
+            new_mask_ratio = ((~new_query_key_padding_mask).int().sum() / new_query_key_padding_mask.numel()).item()
+            storage = get_event_storage()
+            storage.put_scalar('mask/padding_mask_ratio', padding_mask_ratio)
+            storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
+            storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
+
+
+
 
             # assert decoder_reference_points.requires_grad == False
             inter_states.append(decoder_query)
@@ -569,6 +605,59 @@ class RankDetrTransformer(nn.Module):
                 enc_outputs_coord_unact_all[0],
             )
         return inter_states, init_reference_outs[0], inter_references_out, None, None
+    
+    def mask_from_decoder(self, output_coord, output_class, img_true_size, img_batched_sizes, multi_level_feats, topk_ratio, multi_lvl_feature_valid_size):
+        # topk=10
+        bs, num_queries, _= output_coord.shape
+        topk = int(num_queries * topk_ratio )
+        assert topk < num_queries
+        # batched_h, batch_w = img_batched_sizes
+        output_class = output_class.max(dim=-1)[0] # (bs, num_query)
+        topkid = output_class.topk(topk, dim= -1)[1] # (bs, topk)
+        topk_boxes = torch.gather(output_coord, 1, topkid[..., None].repeat(1, 1, 4)) # (bs, topk, 4)
+        topk_boxes = box_cxcywh_to_xyxy(topk_boxes).clamp(min=0, max=1)
+        extra_masks = []
+        for lvl, (feat, valid_feature_size) in enumerate(
+                zip(multi_level_feats, multi_lvl_feature_valid_size)
+            ):
+            bs, _, h, w = feat.shape
+            valid_feature_size = valid_feature_size.repeat(1, 2).view(bs, 1, 4)
+
+            # we omit the difference between true size and batched size here
+            box_feature_range = ( topk_boxes * valid_feature_size ).floor().to(torch.int64)
+            assert  (box_feature_range[..., :2] <= box_feature_range[..., 2:]).all()
+
+            # extra_mask = output_coord.new_ones(bs, h, w, dtype=torch.bool) # 0 mean valid, 1 means invalid
+            # extra_mask1 = extra_mask.clone()
+            # extra_mask2 = extra_mask.clone()
+            # for img_idx in range(bs):
+            #     for loc_id in range(topk):
+            #         lx, ly, rx, ry = box_feature_range[img_idx, loc_id]
+            #         extra_mask1[img_idx][ly:ry, lx:rx] = False
+            #         (extra_mask2[img_idx])[ly:ry, lx:rx] = False
+            
+
+            # Generate grid coordinates
+            grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w))
+
+            # Expand dimensions to match the shape of box_feature_range
+            grid_y = grid_y.view(1, h, w, 1).to(device=box_feature_range.device)
+            grid_x = grid_x.view(1, h, w, 1).to(device=box_feature_range.device)
+
+
+            tmp =   (grid_x >= box_feature_range[..., 0].view(bs, 1, 1, topk)) & \
+                    (grid_x <  box_feature_range[..., 2].view(bs, 1, 1, topk)) & \
+                    (grid_y >= box_feature_range[..., 1].view(bs, 1, 1, topk)) & \
+                    (grid_y <  box_feature_range[..., 3].view(bs, 1, 1, topk))
+            assert tmp.shape == torch.Size([bs, h, w, topk])
+            extra_mask = ~(tmp.any(dim=-1))
+            extra_mask = extra_mask.view(bs, -1)
+            extra_masks.append(extra_mask)
+        extra_masks = torch.cat(extra_masks, dim=1)
+       
+        
+        return extra_masks
+
 
     def cascade_stage(
         self,
@@ -649,7 +738,7 @@ class RankDetrTransformer(nn.Module):
 
 
         decoder_query, decoder_query_pos, rank_indices, \
-            decoder_reference_points, new_reference_points =  \
+            decoder_reference_points, new_reference_points, decoder_output_classes =  \
                 self.cascade_stage_decoder_part(
                     stage_id,
                     query=decoder_query,  # bs, num_queries, embed_dims
@@ -666,10 +755,11 @@ class RankDetrTransformer(nn.Module):
                     **kwargs,
         )
 
+        
 
 
         return ( memory, decoder_query, decoder_query_pos, rank_indices, \
-                 decoder_reference_points, new_reference_points, init_reference_out,\
+                 decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out,\
                  enc_outputs_class, enc_outputs_coord_unact)
     
     def cascade_stage_decoder_part(
@@ -752,8 +842,8 @@ class RankDetrTransformer(nn.Module):
 
             if (stage_id >= 0) and (self.decoder.query_rank_layer or self.decoder.rank_adaptive_classhead):
                 # generate rank indices
-                outputs_class_tmp = self.decoder.class_embed[stage_id](output)  # [bs, num_queries, embed_dim] -> [bs, num_queries, num_classes]
-                rank_basis = outputs_class_tmp.sigmoid().max(dim=2, keepdim=False)[0] # tensor shape: [bs, num_queries]
+                outputs_class_tmp = self.decoder.class_embed[stage_id](output).sigmoid()  # [bs, num_queries, embed_dim] -> [bs, num_queries, num_classes]
+                rank_basis = outputs_class_tmp.max(dim=2, keepdim=False)[0] # tensor shape: [bs, num_queries]
                 if self.decoder.training:
                     rank_indices_one2one  = torch.argsort(rank_basis[:, : self.decoder.num_queries_one2one], dim=1, descending=True) # tensor shape: [bs, num_queries_one2one]
                     rank_indices_one2many = torch.argsort(rank_basis[:, self.decoder.num_queries_one2one :], dim=1, descending=True) # tensor shape: [bs, num_queries_one2many]
@@ -773,7 +863,8 @@ class RankDetrTransformer(nn.Module):
                 new_reference_points = torch.gather(
                     new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
         
-        return output, query_pos, rank_indices, reference_points, new_reference_points
+        
+        return output, query_pos, rank_indices, reference_points, new_reference_points, outputs_class_tmp
 
         
     def cascade_stage_encoder_part(

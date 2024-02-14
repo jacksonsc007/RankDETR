@@ -171,6 +171,8 @@ class RankDETR(nn.Module):
             ])
             for m in self.rank_adaptive_classhead_emb.parameters():
                 nn.init.zeros_(m)
+        
+        self.transformer.num_queries = self.num_queries
 
     def forward(self, batched_inputs):
         images = self.preprocess_image(batched_inputs) # shape (4,3,H,W)
@@ -178,10 +180,13 @@ class RankDETR(nn.Module):
         if self.training:
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_ones(batch_size, H, W)
+            img_true_sizes = []
             for img_id in range(batch_size):
                 # mask padding regions in batched images
                 img_h, img_w = batched_inputs[img_id]["instances"].image_size
                 img_masks[img_id, :img_h, :img_w] = 0
+                img_true_sizes.append((img_h, img_w))
+            img_true_sizes = torch.as_tensor(img_true_sizes, dtype = img_masks.dtype, device=img_masks.device)
         else:
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_zeros(batch_size, H, W)
@@ -191,7 +196,9 @@ class RankDETR(nn.Module):
             save_two_stage_num_proposals = self.transformer.two_stage_num_proposals
             self.num_queries = self.num_queries_one2one
             self.transformer.two_stage_num_proposals = self.num_queries
+            img_true_sizes = torch.as_tensor((H, W), dtype= img_masks.dtype, device=img_masks.device).repeat(batch_size, 1) # TODO this is weird.
 
+        img_batched_sizes = (H, W)
         # original features
         features = self.backbone(images.tensor)  # output feature dict
 
@@ -248,6 +255,8 @@ class RankDETR(nn.Module):
             multi_level_position_embeddings,
             query_embeds,
             self_attn_mask,
+            img_true_sizes,
+            img_batched_sizes,
         )
 
         # Calculate output coordinates and classes.
