@@ -609,9 +609,14 @@ class RankDetrTransformer(nn.Module):
     def mask_from_decoder(self, output_coord, output_class, img_true_size, img_batched_sizes, multi_level_feats, topk_ratio, multi_lvl_feature_valid_size):
         # topk=10
         bs, num_queries, _= output_coord.shape
-        topk = int(num_queries * topk_ratio )
-        assert topk < num_queries
+        topk = int(self.num_queries_one2one * topk_ratio )
+        # assert topk < num_queries
         # batched_h, batch_w = img_batched_sizes
+        
+        # use one2one queries 
+        output_class = output_class[:, :self.num_queries_one2one ].detach()
+        output_coord = output_coord[:, :self.num_queries_one2one ].detach()
+
         output_class = output_class.max(dim=-1)[0] # (bs, num_query)
         topkid = output_class.topk(topk, dim= -1)[1] # (bs, topk)
         topk_boxes = torch.gather(output_coord, 1, topkid[..., None].repeat(1, 1, 4)) # (bs, topk, 4)

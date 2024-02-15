@@ -49,7 +49,7 @@ model.criterion.GIoU_aware_class_loss = True
 model.criterion.matcher.iou_order_alpha = 4.0
 model.criterion.matcher.matcher_change_iter = 67500
 
-model.transformer.topk_ratio=0.05
+model.transformer.topk_ratio=0.1
 
 
 

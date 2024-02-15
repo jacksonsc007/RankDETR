@@ -8,3 +8,6 @@ In this version:
 TODO:
 As only one-to-one queries are used in inference, we consider using only prediction from one-to-one queries to generate mask. Besides, one-to-many queries tend to generate overlapping predictions with similar scores.
 
+version id: v1.2
+1.using only prediction from one-to-one queries to generate mask.
+2.add detach operation during mask generation. 

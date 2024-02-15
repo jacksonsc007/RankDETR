@@ -173,7 +173,9 @@ class RankDETR(nn.Module):
                 nn.init.zeros_(m)
         
         self.transformer.num_queries = self.num_queries
-
+        self.transformer.num_queries_one2one = num_queries_one2one
+        self.transformer.num_queries_one2many = num_queries_one2many
+        
     def forward(self, batched_inputs):
         images = self.preprocess_image(batched_inputs) # shape (4,3,H,W)
 
