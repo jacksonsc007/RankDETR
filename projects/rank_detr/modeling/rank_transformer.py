@@ -63,7 +63,7 @@ class RankDetrTransformerEncoder(TransformerLayerSequence):
                     ffn_drop=ffn_dropout,
                 ),
                 norm=nn.LayerNorm(embed_dim),
-                operation_order=("self_attn", "norm", "ffn", "norm"),
+                operation_order=("cross_attn", "norm", "ffn", "norm"),
             ),
             num_layers=num_layers,
         )
@@ -526,7 +526,6 @@ class RankDetrTransformer(nn.Module):
         )
 
 
-        memory = feat_flatten # init memory
         decoder_query = None
         decoder_query_pos = None
         decoder_reference_points = None
@@ -538,20 +537,30 @@ class RankDetrTransformer(nn.Module):
         enc_outputs_class_all = []
         enc_outputs_coord_unact_all = []
         # topk = int(self.num_queries * self.topk_ratio)
-        new_query_key_padding_mask = mask_flatten
+        
+        sparse_enc_query = feat_flatten
+        sparse_enc_query_pos = lvl_pos_embed_flatten
+        sparse_enc_ref = encoder_reference_points
+        topk_enc_token_indice = None
+        valid_enc_token_num = None
+        # src = feat_flatten
+        memory = feat_flatten
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out, \
             enc_outputs_class, enc_outputs_coord_unact = \
                 self.cascade_stage(
                     stage_id=stage_id,
-                    encoder_query=memory,
-                    encoder_key=None,
-                    encoder_value=None,
-                    encoder_query_pos=lvl_pos_embed_flatten,
+                    src=memory,
+                    encoder_query=sparse_enc_query,
+                    encoder_key=None, # key is not required in deformable attention
+                    encoder_value=memory,
+                    encoder_query_pos=sparse_enc_query_pos,
                     encoder_attn_masks = None,
-                    encoder_reference_points=encoder_reference_points,
-                    query_key_padding_mask=new_query_key_padding_mask,
+                    encoder_reference_points=sparse_enc_ref,
+                    topk_enc_token_indice=topk_enc_token_indice,
+                    valid_enc_token_num=valid_enc_token_num,
+                    query_key_padding_mask=mask_flatten,
                     decoder_query=decoder_query,
                     decoder_query_pos=decoder_query_pos,
                     decoder_query_embed=query_embed,
@@ -565,20 +574,32 @@ class RankDetrTransformer(nn.Module):
             )
             assert memory.isfinite().all()
             
-            extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
-                                             img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
+            if stage_id != self.num_stages:
+                extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
+                                                img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
 
-            assert extra_masks.size() == mask_flatten.size()
-            new_query_key_padding_mask = ( extra_masks | mask_flatten )
-            # new_query_key_padding_mask = new_query_key_padding_mask.float().masked_fill(new_query_key_padding_mask, -INK_INF) 
-            padding_mask_ratio = ((~mask_flatten).int().sum() / mask_flatten.numel()).item()
-            decoder_mask_ratio = ((~extra_masks).int().sum() / extra_masks.numel()).item()
-            new_mask_ratio = ((~new_query_key_padding_mask).int().sum() / new_query_key_padding_mask.numel()).item()
-            storage = get_event_storage()
-            storage.put_scalar('mask/padding_mask_ratio', padding_mask_ratio)
-            storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
-            storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
+                assert extra_masks.size() == mask_flatten.size()
+                new_query_key_padding_mask = ( extra_masks | mask_flatten )
+            
+                # wandb logging
+                # new_query_key_padding_mask = new_query_key_padding_mask.float().masked_fill(new_query_key_padding_mask, -INK_INF) 
+                padding_mask_ratio = ((~mask_flatten).int().sum() / mask_flatten.numel()).item()
+                decoder_mask_ratio = ((~extra_masks).int().sum() / extra_masks.numel()).item()
+                new_mask_ratio = ((~new_query_key_padding_mask).int().sum() / new_query_key_padding_mask.numel()).item()
+                storage = get_event_storage()
+                storage.put_scalar('mask/padding_mask_ratio', padding_mask_ratio)
+                storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
+                storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
 
+                valid_enc_token_num = (~new_query_key_padding_mask).int().sum(dim=1)
+                batch_token_num = int(max(valid_enc_token_num))
+                topk_enc_token_indice = (~new_query_key_padding_mask).int().topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
+                feature_dim = memory.size(2)
+                sparse_enc_query = memory.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
+                sparse_enc_query_pos = lvl_pos_embed_flatten.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
+                num_lvl = encoder_reference_points.size(2)
+                sparse_enc_ref = encoder_reference_points.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).unsqueeze(dim=3).repeat(1, 1, num_lvl, 2)) # (x, y) for ref points
+            
 
 
 
@@ -667,12 +688,15 @@ class RankDetrTransformer(nn.Module):
     def cascade_stage(
         self,
         stage_id,
+        src,
         encoder_query,
         encoder_key,
         encoder_value,
         encoder_query_pos,
         encoder_attn_masks,
         encoder_reference_points,
+        topk_enc_token_indice,
+        valid_enc_token_num,
         query_key_padding_mask,
         decoder_query,
         decoder_query_pos,
@@ -687,16 +711,20 @@ class RankDetrTransformer(nn.Module):
     ):
         memory = self.cascade_stage_encoder_part(
             stage_id,
+            src=src,
             query=encoder_query,
             key=encoder_key,
             value=encoder_value,
             query_pos=encoder_query_pos,
+            key_pos=None, # key pos is not required in deformable attention
             attn_masks=encoder_attn_masks,
-            query_key_padding_mask=query_key_padding_mask,
+            key_padding_mask=query_key_padding_mask, # encoder now adopt cross-attention
             spatial_shapes=spatial_shapes,
             reference_points=encoder_reference_points,
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
+            topk_enc_token_indice=topk_enc_token_indice,
+            valid_enc_token_num=valid_enc_token_num,
             **kwargs,
         )
 
@@ -767,6 +795,62 @@ class RankDetrTransformer(nn.Module):
                  decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out,\
                  enc_outputs_class, enc_outputs_coord_unact)
     
+        
+    def cascade_stage_encoder_part(
+        self,
+        stage_id,
+        src,
+        query,
+        key,
+        value,
+        query_pos=None,
+        key_pos=None,
+        attn_masks=None,
+        query_key_padding_mask=None,
+        key_padding_mask=None,
+        topk_enc_token_indice=None,
+        valid_enc_token_num=None,
+        **kwargs,
+    ):
+        encoder_layer = self.encoder.layers[stage_id] 
+        sparse_memory = encoder_layer(
+            query,
+            key,
+            value,
+            query_pos=query_pos,
+            key_pos=key_pos, 
+            attn_masks=attn_masks,
+            query_key_padding_mask=query_key_padding_mask,
+            key_padding_mask=key_padding_mask,
+            **kwargs, 
+        )
+
+        if topk_enc_token_indice is not None:
+            assert valid_enc_token_num is not None
+            bs = topk_enc_token_indice.size(0) 
+            outputs=[]
+            for img_id, (num, idx) in enumerate(zip(valid_enc_token_num, topk_enc_token_indice)):
+                valid_idx = idx[:num]
+                # src[0]: (ori_num_token, 256)
+                # idx: (valid_num,) -> (valid_num, 256)
+                # sparse_memory[0]: (max_token_num, 256)
+                # src[0][index[i,j], j] = sparse_memory[0][i,j]
+                outputs.append(src[img_id].scatter(dim=0, index=valid_idx.unsqueeze(1).repeat(1, src.size(-1)), src=sparse_memory[img_id][:num]))
+            memory = torch.stack(outputs)
+            assert memory.size(0) == bs
+
+        else: 
+            memory=sparse_memory
+                
+
+            
+
+        if stage_id == (self.num_stages - 1) and self.encoder.post_norm_layer is not None :
+            memory = self.encoder.post_norm_layer(memory)
+        return memory
+       
+        
+
     def cascade_stage_decoder_part(
         self,
         stage_id,
@@ -870,34 +954,3 @@ class RankDetrTransformer(nn.Module):
         
         
         return output, query_pos, rank_indices, reference_points, new_reference_points, outputs_class_tmp
-
-        
-    def cascade_stage_encoder_part(
-        self,
-        stage_id,
-        query,
-        key,
-        value,
-        query_pos=None,
-        key_pos=None,
-        attn_masks=None,
-        query_key_padding_mask=None,
-        key_padding_mask=None,
-        **kwargs,
-    ):
-        encoder_layer = self.encoder.layers[stage_id] 
-        memory = encoder_layer(
-            query,
-            key,
-            value,
-            query_pos=query_pos,
-            attn_masks=attn_masks,
-            query_key_padding_mask=query_key_padding_mask,
-            key_padding_mask=key_padding_mask,
-            **kwargs, 
-        )
-        if stage_id == (self.num_stages - 1) and self.encoder.post_norm_layer is not None :
-            memory = self.encoder.post_norm_layer(memory)
-        return memory
-       
-        
