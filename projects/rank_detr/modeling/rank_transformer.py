@@ -582,6 +582,10 @@ class RankDetrTransformer(nn.Module):
                 sampling_locations = sampling_locations[:, None]
                 attention_weights = attention_weights[:, None]
                 
+                # only use one2one queries 
+                num_one2one_queries = self.num_queries_one2one
+                sampling_locations = sampling_locations[:, :, :num_one2one_queries]
+                attention_weights = attention_weights[:, :, :num_one2one_queries]
                 # (bs, 1, num_head, num_all_lvl_tokens) -> (bs, num_all_lvl_tokens)
                 cross_attn_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights).sum(dim=(1,2))
                 assert cross_attn_map.size() == mask_flatten.size()
@@ -969,6 +973,7 @@ class RankDetrTransformer(nn.Module):
         
         return output, query_pos, rank_indices, reference_points, new_reference_points, outputs_class_tmp, sampling_locations, attention_weights
 
+# https://github.com/kakaobrain/sparse-detr/blob/f40632c3f4678b1906b40d7913057a46fc5c09c5/util/dam.py#L29
 def attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights):
     # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
     # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]

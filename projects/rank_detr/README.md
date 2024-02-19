@@ -47,3 +47,7 @@ The basic idea is as follows:
 In this naive topk scheme, certain implementations may bring some drawbacks:
 1. most queries are background queries, whose contribution to the calculation of cross-attention weights for multi-lvl features tokens should be weakened.
 2. low-lvl feature tokens outnumber higher-lvls substantially. Feed multi-lvl tokens together to the topk selection process could be unfair for high-lvl tokens.
+3. queries used to calculate attention weight (function: attn_map_to_flat_grid) include one-to-many queries, which will not be used in inference.
+
+## v2.0.1
+In this minor version, only one-to-one queries participate the calculation of function attn_map_to_flat_grid. The reason for making this minor change lies in that only one-to-one queries are used in inference.
