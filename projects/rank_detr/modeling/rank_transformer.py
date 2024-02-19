@@ -363,7 +363,7 @@ class RankDetrTransformer(nn.Module):
         "symmetric encoder decoders design is now required."
         self.num_stages = self.encoder.num_layers
 
-        self.topk_ratio=topk_ratio
+        self.topk_ratios= [topk_ratio for _ in range(self.num_stages)]
 
     def init_weights(self):
         for p in self.parameters():
@@ -545,10 +545,14 @@ class RankDetrTransformer(nn.Module):
         valid_enc_token_num = None
         # src = feat_flatten
         memory = feat_flatten
+        valid_tokens_nums_all_imgs = (~mask_flatten).int().sum(dim=1)
+        
+
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out, \
-            enc_outputs_class, enc_outputs_coord_unact = \
+            enc_outputs_class, enc_outputs_coord_unact, \
+                 sampling_locations, attention_weights = \
                 self.cascade_stage(
                     stage_id=stage_id,
                     src=memory,
@@ -575,25 +579,32 @@ class RankDetrTransformer(nn.Module):
             assert memory.isfinite().all()
             
             if stage_id != self.num_stages:
-                extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
-                                                img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
+                sampling_locations = sampling_locations[:, None]
+                attention_weights = attention_weights[:, None]
+                
+                # (bs, 1, num_head, num_all_lvl_tokens) -> (bs, num_all_lvl_tokens)
+                cross_attn_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights).sum(dim=(1,2))
+                assert cross_attn_map.size() == mask_flatten.size()
+                cross_attn_map = cross_attn_map.masked_fill(mask_flatten, cross_attn_map.min()-1)
+                # extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
+                #                                 img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
 
-                assert extra_masks.size() == mask_flatten.size()
-                new_query_key_padding_mask = ( extra_masks | mask_flatten )
+                # assert extra_masks.size() == mask_flatten.size()
+                # new_query_key_padding_mask = ( extra_masks | mask_flatten )
             
                 # wandb logging
                 # new_query_key_padding_mask = new_query_key_padding_mask.float().masked_fill(new_query_key_padding_mask, -INK_INF) 
-                padding_mask_ratio = ((~mask_flatten).int().sum() / mask_flatten.numel()).item()
-                decoder_mask_ratio = ((~extra_masks).int().sum() / extra_masks.numel()).item()
-                new_mask_ratio = ((~new_query_key_padding_mask).int().sum() / new_query_key_padding_mask.numel()).item()
-                storage = get_event_storage()
-                storage.put_scalar('mask/padding_mask_ratio', padding_mask_ratio)
-                storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
-                storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
+                # padding_mask_ratio = ((~mask_flatten).int().sum() / mask_flatten.numel()).item()
+                # decoder_mask_ratio = ((~extra_masks).int().sum() / extra_masks.numel()).item()
+                # new_mask_ratio = ((~new_query_key_padding_mask).int().sum() / new_query_key_padding_mask.numel()).item()
+                # storage = get_event_storage()
+                # storage.put_scalar('mask/padding_mask_ratio', padding_mask_ratio)
+                # storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
+                # storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
 
-                valid_enc_token_num = (~new_query_key_padding_mask).int().sum(dim=1)
-                batch_token_num = int(max(valid_enc_token_num))
-                topk_enc_token_indice = (~new_query_key_padding_mask).int().topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
+                valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_ratios[stage_id]).int() + 1
+                batch_token_num = max(valid_enc_token_num)
+                topk_enc_token_indice = cross_attn_map.topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
                 feature_dim = memory.size(2)
                 sparse_enc_query = memory.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
                 sparse_enc_query_pos = lvl_pos_embed_flatten.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
@@ -626,6 +637,8 @@ class RankDetrTransformer(nn.Module):
                 enc_outputs_coord_unact_all[0],
             )
         return inter_states, init_reference_outs[0], inter_references_out, None, None
+    
+    
     
     def mask_from_decoder(self, output_coord, output_class, img_true_size, img_batched_sizes, multi_level_feats, topk_ratio, multi_lvl_feature_valid_size):
         # topk=10
@@ -771,7 +784,8 @@ class RankDetrTransformer(nn.Module):
 
 
         decoder_query, decoder_query_pos, rank_indices, \
-            decoder_reference_points, new_reference_points, decoder_output_classes =  \
+            decoder_reference_points, new_reference_points, decoder_output_classes, \
+                sampling_locations, attention_weights =  \
                 self.cascade_stage_decoder_part(
                     stage_id,
                     query=decoder_query,  # bs, num_queries, embed_dims
@@ -793,7 +807,7 @@ class RankDetrTransformer(nn.Module):
 
         return ( memory, decoder_query, decoder_query_pos, rank_indices, \
                  decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out,\
-                 enc_outputs_class, enc_outputs_coord_unact)
+                 enc_outputs_class, enc_outputs_coord_unact, sampling_locations, attention_weights)
     
         
     def cascade_stage_encoder_part(
@@ -813,7 +827,7 @@ class RankDetrTransformer(nn.Module):
         **kwargs,
     ):
         encoder_layer = self.encoder.layers[stage_id] 
-        sparse_memory = encoder_layer(
+        sparse_memory, _, _ = encoder_layer(
             query,
             key,
             value,
@@ -902,7 +916,7 @@ class RankDetrTransformer(nn.Module):
             reference_points_input = reference_points[:, :, None] * valid_ratios[:, None] 
 
         layer = self.decoder.layers[stage_id]
-        output = layer(
+        output, sampling_locations, attention_weights = layer(
             output,
             key,
             value,
@@ -953,4 +967,44 @@ class RankDetrTransformer(nn.Module):
                     new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
         
         
-        return output, query_pos, rank_indices, reference_points, new_reference_points, outputs_class_tmp
+        return output, query_pos, rank_indices, reference_points, new_reference_points, outputs_class_tmp, sampling_locations, attention_weights
+
+def attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights):
+    # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
+    # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]
+    N, n_layers, _, n_heads, *_ = sampling_locations.shape
+    sampling_locations = sampling_locations.permute(0, 1, 3, 2, 5, 4, 6).flatten(0, 2).flatten(1, 2)
+    # [N * n_layers * n_heads, Len_q * n_points, n_levels, 2]
+    attention_weights = attention_weights.permute(0, 1, 3, 2, 5, 4).flatten(0, 2).flatten(1, 2)
+    # [N * n_layers * n_heads, Len_q * n_points, n_levels]
+
+    rev_spatial_shapes = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1) # hw -> wh (xy)
+    col_row_float = sampling_locations * rev_spatial_shapes
+    # get 4 corner integeral positions around the floating-type sampling locations. 
+    col_row_ll = col_row_float.floor().to(torch.int64)
+    zero = torch.zeros(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device)
+    one = torch.ones(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device)
+    col_row_lh = col_row_ll + torch.stack([zero, one], dim=-1)
+    col_row_hl = col_row_ll + torch.stack([one, zero], dim=-1)
+    col_row_hh = col_row_ll + 1
+    # compute magin for bilinear interpolation
+    margin_ll = (col_row_float - col_row_ll).prod(dim=-1)
+    margin_lh = -(col_row_float - col_row_lh).prod(dim=-1)
+    margin_hl = -(col_row_float - col_row_hl).prod(dim=-1)
+    margin_hh = (col_row_float - col_row_hh).prod(dim=-1)
+
+    flat_grid_shape = (attention_weights.shape[0], int(torch.sum(spatial_shapes[..., 0] * spatial_shapes[..., 1])))
+    flat_grid = torch.zeros(flat_grid_shape, dtype=torch.float32, device=attention_weights.device)
+
+    zipped = [(col_row_ll, margin_hh), (col_row_lh, margin_hl), (col_row_hl, margin_lh), (col_row_hh, margin_ll)]
+    for col_row, margin in zipped:
+        valid_mask = torch.logical_and(
+            torch.logical_and(col_row[..., 0] >= 0, col_row[..., 0] < rev_spatial_shapes[..., 0]),
+            torch.logical_and(col_row[..., 1] >= 0, col_row[..., 1] < rev_spatial_shapes[..., 1]),
+        )
+        idx = col_row[..., 1] * spatial_shapes[..., 1] + col_row[..., 0] + level_start_index
+        idx = (idx * valid_mask).flatten(1, 2)
+        weights = (attention_weights * valid_mask * margin).flatten(1)
+        flat_grid.scatter_add_(1, idx, weights)
+
+    return flat_grid.reshape(N, n_layers, n_heads, -1)

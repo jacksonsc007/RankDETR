@@ -34,3 +34,16 @@ There are three minor versions which differ in the src and value: (check the src
 Experiment results shows that the second one achieves better performance.
 
 #TODO Selected keys instead of queries.
+
+
+# version id: v2.0
+In this major version, the cross attention map is used to select salient multi-lvl feature locations, following sparse-detr. For comparison, version 1.x make use of predicted boxes as the criterion for selection.
+
+The basic idea is as follows:
+1. determine the valid tokens numbers for each images after padding.
+2. set a predefiend topk_ratio and multiply it with the valid tokens number for each image. The result serves as the selected token numbers for each image. Then select those tokens having topk cross-attention weights with object queries.
+
+
+In this naive topk scheme, certain implementations may bring some drawbacks:
+1. most queries are background queries, whose contribution to the calculation of cross-attention weights for multi-lvl features tokens should be weakened.
+2. low-lvl feature tokens outnumber higher-lvls substantially. Feed multi-lvl tokens together to the topk selection process could be unfair for high-lvl tokens.
