@@ -363,7 +363,8 @@ class RankDetrTransformer(nn.Module):
         "symmetric encoder decoders design is now required."
         self.num_stages = self.encoder.num_layers
 
-        self.topk_ratios= [topk_ratio for _ in range(self.num_stages)]
+        self.topk_token_ratios= [topk_ratio for _ in range(self.num_stages)]
+        self.topk_box_ratios= [topk_ratio for _ in range(self.num_stages)]
 
     def init_weights(self):
         for p in self.parameters():
@@ -584,8 +585,22 @@ class RankDetrTransformer(nn.Module):
                 
                 # only use one2one queries 
                 num_one2one_queries = self.num_queries_one2one
-                sampling_locations = sampling_locations[:, :, :num_one2one_queries]
-                attention_weights = attention_weights[:, :, :num_one2one_queries]
+                # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
+                # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]
+                sampling_locations = sampling_locations[:, :, :num_one2one_queries].detach()
+                attention_weights = attention_weights[:, :, :num_one2one_queries].detach()
+                decoder_output_classes = decoder_output_classes[:, :num_one2one_queries].detach()
+                # filter out background object queries
+                topk_boxes_num = int(num_one2one_queries * self.topk_box_ratios[stage_id])  + 1
+                decoder_output_classes_max = decoder_output_classes.max(dim=-1)[0]
+                topk_boxes_indice =  decoder_output_classes_max.topk(topk_boxes_num, dim=-1)[1] # (bs, topk_boxes_num)
+                bs, _, _, n_heads, n_levels, n_points, _= sampling_locations.size()
+                sampling_locations = sampling_locations.gather(dim=2, index=topk_boxes_indice.view(
+                    bs, 1, topk_boxes_num, 1, 1, 1, 1).repeat(1, 1, 1, n_heads, n_levels, n_points, 2))
+
+                attention_weights = attention_weights.gather(dim=2, index=topk_boxes_indice.view(
+                    bs, 1, topk_boxes_num, 1, 1, 1).repeat(1, 1, 1, n_heads, n_levels, n_points))
+
                 # (bs, 1, num_head, num_all_lvl_tokens) -> (bs, num_all_lvl_tokens)
                 cross_attn_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights).sum(dim=(1,2))
                 assert cross_attn_map.size() == mask_flatten.size()
@@ -606,7 +621,7 @@ class RankDetrTransformer(nn.Module):
                 # storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
                 # storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
 
-                valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_ratios[stage_id]).int() + 1
+                valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int() + 1
                 batch_token_num = max(valid_enc_token_num)
                 topk_enc_token_indice = cross_attn_map.topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
                 feature_dim = memory.size(2)

@@ -51,3 +51,17 @@ In this naive topk scheme, certain implementations may bring some drawbacks:
 
 ## v2.0.1
 In this minor version, only one-to-one queries participate the calculation of function attn_map_to_flat_grid. The reason for making this minor change lies in that only one-to-one queries are used in inference.
+
+Results showed that this modification **did not** help.
+
+## v2.0.2
+In this minor version, we want to get rid of the impact of background queries on calculation of the function attn_map_to_flat_grid. So:
+
+1. first select object queries with topk classificiation score, which hopefully get rid of object queries corresponds to background.
+2. only those selected object queries contribute to the calculation of the function attn_map_to_flat_grid.
+
+Results showed that this modification **did not** help.
+
+#TODO In later versions, we consider:
+1. using the cross-attention map to initialize the reference points for encoder deformable attention.
+2. fixed class threhold to select topk boxes during inference & training.
