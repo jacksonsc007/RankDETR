@@ -65,3 +65,9 @@ Results showed that this modification **did not** help.
 #TODO In later versions, we consider:
 1. using the cross-attention map to initialize the reference points for encoder deformable attention.
 2. fixed class threhold to select topk boxes during inference & training.
+
+## v2.0.3
+In this version, we start from v2.0, which means we use both one-to-one and one-to-many queries. This is only one change we want to make:
+1. always keep the tokens from last feature maps
+
+we want to validate whether a simple topk scheme among all feature levels will be detrimental to performance. The last feature level is outnumbered largely but the first feature level.

@@ -548,7 +548,8 @@ class RankDetrTransformer(nn.Module):
         memory = feat_flatten
         valid_tokens_nums_all_imgs = (~mask_flatten).int().sum(dim=1)
         
-
+        num_lvl = len(multi_level_feats)
+        num_points_per_lvl = spatial_shapes.prod(1)
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out, \
@@ -580,30 +581,15 @@ class RankDetrTransformer(nn.Module):
             assert memory.isfinite().all()
             
             if stage_id != self.num_stages:
-                sampling_locations = sampling_locations[:, None]
-                attention_weights = attention_weights[:, None]
+                sampling_locations = sampling_locations[:, None].detach()
+                attention_weights = attention_weights[:, None].detach()
                 
-                # only use one2one queries 
-                num_one2one_queries = self.num_queries_one2one
-                # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
-                # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]
-                sampling_locations = sampling_locations[:, :, :num_one2one_queries].detach()
-                attention_weights = attention_weights[:, :, :num_one2one_queries].detach()
-                decoder_output_classes = decoder_output_classes[:, :num_one2one_queries].detach()
-                # filter out background object queries
-                topk_boxes_num = int(num_one2one_queries * self.topk_box_ratios[stage_id])  + 1
-                decoder_output_classes_max = decoder_output_classes.max(dim=-1)[0]
-                topk_boxes_indice =  decoder_output_classes_max.topk(topk_boxes_num, dim=-1)[1] # (bs, topk_boxes_num)
-                bs, _, _, n_heads, n_levels, n_points, _= sampling_locations.size()
-                sampling_locations = sampling_locations.gather(dim=2, index=topk_boxes_indice.view(
-                    bs, 1, topk_boxes_num, 1, 1, 1, 1).repeat(1, 1, 1, n_heads, n_levels, n_points, 2))
 
-                attention_weights = attention_weights.gather(dim=2, index=topk_boxes_indice.view(
-                    bs, 1, topk_boxes_num, 1, 1, 1).repeat(1, 1, 1, n_heads, n_levels, n_points))
 
                 # (bs, 1, num_head, num_all_lvl_tokens) -> (bs, num_all_lvl_tokens)
                 cross_attn_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights).sum(dim=(1,2))
                 assert cross_attn_map.size() == mask_flatten.size()
+                cross_attn_map[:, level_start_index[-1]:] = cross_attn_map.max() + 1 # make sure last feature map tokens are all kept
                 cross_attn_map = cross_attn_map.masked_fill(mask_flatten, cross_attn_map.min()-1)
                 # extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
                 #                                 img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
@@ -621,13 +607,24 @@ class RankDetrTransformer(nn.Module):
                 # storage.put_scalar('mask/decoder_mask_ratio', decoder_mask_ratio)
                 # storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
 
-                valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int() + 1
+                # valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int()
+                # valid_enc_token_num_per_lvl = (valid_enc_token_num / num_lvl).int()
+                # valid_enc_token_num = valid_enc_token_num_per_lvl * num_lvl
+                # batch_token_num_per_lvl = max(valid_enc_token_num_per_lvl)
+                # topk_enc_token_indice = []                
+                # for lvl_id, (start_id, num_per_lvl) in enumerate(zip(level_start_index, num_points_per_lvl)):
+                #     topk_id_per_lvl = cross_attn_map[:, start_id:(start_id+num_per_lvl)].topk(batch_token_num_per_lvl, dim=1)[1] + start_id
+                #     topk_enc_token_indice.append(topk_id_per_lvl)
+                # topk_enc_token_indice = torch.cat(topk_enc_token_indice, dim=1)
+                
+
+
+                valid_enc_token_num = (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int() + 1
                 batch_token_num = max(valid_enc_token_num)
                 topk_enc_token_indice = cross_attn_map.topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
                 feature_dim = memory.size(2)
                 sparse_enc_query = memory.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
                 sparse_enc_query_pos = lvl_pos_embed_flatten.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
-                num_lvl = encoder_reference_points.size(2)
                 sparse_enc_ref = encoder_reference_points.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).unsqueeze(dim=3).repeat(1, 1, num_lvl, 2)) # (x, y) for ref points
             
 
