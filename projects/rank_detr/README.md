@@ -67,7 +67,16 @@ Results showed that this modification **did not** help.
 2. fixed class threhold to select topk boxes during inference & training.
 
 ## v2.0.3
-In this version, we start from v2.0, which means we use both one-to-one and one-to-many queries. This is only one change we want to make:
+In this version, we start from v2.0, which means we use both one-to-one and one-to-many queries. There is only one change we want to make:
+
 1. always keep the tokens from last feature maps
 
 we want to validate whether a simple topk scheme among all feature levels will be detrimental to performance. The last feature level is outnumbered largely but the first feature level.
+
+Results showed that this modification **did not** help.
+
+## v2.0.4
+
+In this version, we start from v2.0, which means we use both one-to-one and one-to-many queries. There is only one change we want to make:
+
+1. we sample tokens from each feature level separately, which means we don't mix tokens from differents levels together when we're selecting according to the topk_ratio. 

@@ -490,6 +490,7 @@ class RankDetrTransformer(nn.Module):
         lvl_pos_embed_flatten = []
         spatial_shapes = []
         multi_lvl_feature_valid_size = []
+        valid_token_all_lvls = []
         for lvl, (feat, mask, pos_embed) in enumerate(
             zip(multi_level_feats, multi_level_masks, multi_level_pos_embeds)
         ):
@@ -506,6 +507,7 @@ class RankDetrTransformer(nn.Module):
             pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
             lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1) # level_embed to distinguish levels?
             lvl_pos_embed_flatten.append(lvl_pos_embed)
+            valid_token_all_lvls.append((~mask).int().sum(dim=1))
 
 
 
@@ -514,6 +516,7 @@ class RankDetrTransformer(nn.Module):
         feat_flatten = torch.cat(feat_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        valid_token_all_lvls = torch.stack(valid_token_all_lvls, dim=1) # (bs, 4)
         spatial_shapes = torch.as_tensor(
             spatial_shapes, dtype=torch.long, device=feat_flatten.device # featuer map shape
         )
@@ -544,12 +547,14 @@ class RankDetrTransformer(nn.Module):
         sparse_enc_ref = encoder_reference_points
         topk_enc_token_indice = None
         valid_enc_token_num = None
+        batch_sparse_tohken_lvl_start_idx = None
         # src = feat_flatten
         memory = feat_flatten
         valid_tokens_nums_all_imgs = (~mask_flatten).int().sum(dim=1)
         
         num_lvl = len(multi_level_feats)
         num_points_per_lvl = spatial_shapes.prod(1)
+
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, decoder_output_classes, init_reference_out, \
@@ -566,6 +571,7 @@ class RankDetrTransformer(nn.Module):
                     encoder_reference_points=sparse_enc_ref,
                     topk_enc_token_indice=topk_enc_token_indice,
                     valid_enc_token_num=valid_enc_token_num,
+                    batch_sparse_tohken_lvl_start_idx=batch_sparse_tohken_lvl_start_idx,
                     query_key_padding_mask=mask_flatten,
                     decoder_query=decoder_query,
                     decoder_query_pos=decoder_query_pos,
@@ -589,7 +595,6 @@ class RankDetrTransformer(nn.Module):
                 # (bs, 1, num_head, num_all_lvl_tokens) -> (bs, num_all_lvl_tokens)
                 cross_attn_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights).sum(dim=(1,2))
                 assert cross_attn_map.size() == mask_flatten.size()
-                cross_attn_map[:, level_start_index[-1]:] = cross_attn_map.max() + 1 # make sure last feature map tokens are all kept
                 cross_attn_map = cross_attn_map.masked_fill(mask_flatten, cross_attn_map.min()-1)
                 # extra_masks = self.mask_from_decoder( decoder_reference_points, decoder_output_classes, img_true_sizes, \
                 #                                 img_batched_sizes, multi_level_feats, self.topk_ratio, multi_lvl_feature_valid_size)
@@ -608,20 +613,23 @@ class RankDetrTransformer(nn.Module):
                 # storage.put_scalar('mask/new_mask_ratio', new_mask_ratio)
 
                 # valid_enc_token_num =  (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int()
-                # valid_enc_token_num_per_lvl = (valid_enc_token_num / num_lvl).int()
+                valid_enc_token_num_per_lvl = (valid_token_all_lvls * self.topk_token_ratios[stage_id]).int() # (bs, 4)
                 # valid_enc_token_num = valid_enc_token_num_per_lvl * num_lvl
-                # batch_token_num_per_lvl = max(valid_enc_token_num_per_lvl)
-                # topk_enc_token_indice = []                
-                # for lvl_id, (start_id, num_per_lvl) in enumerate(zip(level_start_index, num_points_per_lvl)):
-                #     topk_id_per_lvl = cross_attn_map[:, start_id:(start_id+num_per_lvl)].topk(batch_token_num_per_lvl, dim=1)[1] + start_id
-                #     topk_enc_token_indice.append(topk_id_per_lvl)
-                # topk_enc_token_indice = torch.cat(topk_enc_token_indice, dim=1)
+                batch_token_num_per_lvl = (valid_enc_token_num_per_lvl.max(dim=0))[0] # (4, )
+                batch_sparse_tohken_lvl_start_idx = torch.cat(
+                   ( batch_token_num_per_lvl.new_zeros((1,)), batch_token_num_per_lvl.cumsum(0)[:-1] ), dim=0
+                )
+                topk_enc_token_indice = []                
+                for lvl_id, (topk_num, start_id, num_per_lvl) in enumerate(zip(batch_token_num_per_lvl, level_start_index, num_points_per_lvl)):
+                    topk_id_per_lvl = cross_attn_map[:, start_id:(start_id+num_per_lvl)].topk(topk_num, dim=1)[1] + start_id
+                    topk_enc_token_indice.append(topk_id_per_lvl)
+                topk_enc_token_indice = torch.cat(topk_enc_token_indice, dim=1)
                 
 
-
-                valid_enc_token_num = (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int() + 1
-                batch_token_num = max(valid_enc_token_num)
-                topk_enc_token_indice = cross_attn_map.topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
+                valid_enc_token_num = valid_enc_token_num_per_lvl
+                # valid_enc_token_num = (valid_tokens_nums_all_imgs * self.topk_token_ratios[stage_id]).int() + 1
+                # batch_token_num = max(valid_enc_token_num)
+                # topk_enc_token_indice = cross_attn_map.topk(batch_token_num, dim=1)[1] # (bs, batch_token_num)
                 feature_dim = memory.size(2)
                 sparse_enc_query = memory.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
                 sparse_enc_query_pos = lvl_pos_embed_flatten.gather(dim=1, index=topk_enc_token_indice.unsqueeze(dim=2).repeat(1, 1, feature_dim))
@@ -726,6 +734,7 @@ class RankDetrTransformer(nn.Module):
         encoder_reference_points,
         topk_enc_token_indice,
         valid_enc_token_num,
+        batch_sparse_tohken_lvl_start_idx,
         query_key_padding_mask,
         decoder_query,
         decoder_query_pos,
@@ -754,6 +763,7 @@ class RankDetrTransformer(nn.Module):
             valid_ratios=valid_ratios,
             topk_enc_token_indice=topk_enc_token_indice,
             valid_enc_token_num=valid_enc_token_num,
+            batch_sparse_tohken_lvl_start_idx=batch_sparse_tohken_lvl_start_idx,
             **kwargs,
         )
 
@@ -840,6 +850,7 @@ class RankDetrTransformer(nn.Module):
         key_padding_mask=None,
         topk_enc_token_indice=None,
         valid_enc_token_num=None,
+        batch_sparse_tohken_lvl_start_idx=None,
         **kwargs,
     ):
         encoder_layer = self.encoder.layers[stage_id] 
@@ -857,15 +868,30 @@ class RankDetrTransformer(nn.Module):
 
         if topk_enc_token_indice is not None:
             assert valid_enc_token_num is not None
+            assert batch_sparse_tohken_lvl_start_idx is not None
             bs = topk_enc_token_indice.size(0) 
             outputs=[]
-            for img_id, (num, idx) in enumerate(zip(valid_enc_token_num, topk_enc_token_indice)):
-                valid_idx = idx[:num]
-                # src[0]: (ori_num_token, 256)
-                # idx: (valid_num,) -> (valid_num, 256)
-                # sparse_memory[0]: (max_token_num, 256)
-                # src[0][index[i,j], j] = sparse_memory[0][i,j]
-                outputs.append(src[img_id].scatter(dim=0, index=valid_idx.unsqueeze(1).repeat(1, src.size(-1)), src=sparse_memory[img_id][:num]))
+            # for img_id, (num, idx) in enumerate(zip(valid_enc_token_num, topk_enc_token_indice)):
+            #     valid_idx = idx[:num]
+            #     # src[0]: (ori_num_token, 256)
+            #     # idx: (valid_num,) -> (valid_num, 256)
+            #     # sparse_memory[0]: (max_token_num, 256)
+            #     # src[0][index[i,j], j] = sparse_memory[0][i,j]
+            #     outputs.append(src[img_id].scatter(dim=0, index=valid_idx.unsqueeze(1).repeat(1, src.size(-1)), src=sparse_memory[img_id][:num]))
+
+            for img_id, (valid_num_all_lvl, idx_all_lvl) in enumerate(zip(valid_enc_token_num, topk_enc_token_indice)):
+                valid_idx1 = [] # idx among all tokens
+                valid_idx2 = [] # idx among sparse tokens
+                for lvl, (num, idx) in enumerate(zip(valid_num_all_lvl, batch_sparse_tohken_lvl_start_idx)):
+
+                    valid_idx1.append(idx_all_lvl[idx:idx+num])
+                    valid_idx2.append(torch.arange(idx, idx+num))
+                valid_idx1 = torch.cat(valid_idx1, dim=0)    
+                valid_idx2 = torch.cat(valid_idx2, dim=0)    
+
+                outputs.append( src[img_id].scatter(dim=0, index=valid_idx1.unsqueeze(1).repeat(1, src.size(-1)), src=sparse_memory[img_id][valid_idx2]) )
+
+            
             memory = torch.stack(outputs)
             assert memory.size(0) == bs
 
