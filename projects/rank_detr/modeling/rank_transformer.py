@@ -524,7 +524,8 @@ class RankDetrTransformer(nn.Module):
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
-            enc_outputs_class, enc_outputs_coord_unact = \
+            enc_outputs_class, enc_outputs_coord_unact, \
+                 decoder_sampling_locations, decoder_attention_weights = \
                 self.cascade_stage(
                     stage_id=stage_id,
                     encoder_query=memory,
@@ -545,6 +546,31 @@ class RankDetrTransformer(nn.Module):
                     rank_indices=rank_indices,
                     **kwargs
             )
+
+            # if stage_id != (self.num_stages - 1):
+            #     # sampling_locations: [N, 1, Len_q, n_heads, n_levels, n_points, 2]
+            #     # attention_weights: [N, 1, Len_q, n_heads, n_levels, n_points]
+            #     decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
+            #     decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
+            #     N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
+            #     N, num_tokens_all_lvl, _, _ = encoder_reference_points.size()
+
+            #     # (N, num_all_lvl_tokens, num_decoder_queries)
+            #     decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
+
+            #     # naive design
+            #     topk_query_idx = decoder_cross_attention_map.topk(n_levels, dim=2)[1] # (N, num_all_lvl_tokens, num_levels)
+
+            #     # decoder_reference_points: (N, Len_q, 4)
+            #     # topk_predictions = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
+            #     topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
+
+            #     # topk_predictions: (bs, num_all_lvl_tokens, num_levels, 2)
+            #     # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 2)
+            #     encoder_reference_points = topk_predictions_center * valid_ratios[:, None]
+
+
+
 
             # assert decoder_reference_points.requires_grad == False
             inter_states.append(decoder_query)
@@ -649,7 +675,8 @@ class RankDetrTransformer(nn.Module):
 
 
         decoder_query, decoder_query_pos, rank_indices, \
-            decoder_reference_points, new_reference_points =  \
+            decoder_reference_points, new_reference_points, \
+                decoder_sampling_locations, decoder_attention_weights=  \
                 self.cascade_stage_decoder_part(
                     stage_id,
                     query=decoder_query,  # bs, num_queries, embed_dims
@@ -670,7 +697,7 @@ class RankDetrTransformer(nn.Module):
 
         return ( memory, decoder_query, decoder_query_pos, rank_indices, \
                  decoder_reference_points, new_reference_points, init_reference_out,\
-                 enc_outputs_class, enc_outputs_coord_unact)
+                 enc_outputs_class, enc_outputs_coord_unact, decoder_sampling_locations, decoder_attention_weights)
     
     def cascade_stage_decoder_part(
         self,
@@ -715,15 +742,15 @@ class RankDetrTransformer(nn.Module):
 
         if reference_points.shape[-1] == 4:
             reference_points_input = (
-                reference_points[:, :, None]
-                * torch.cat([valid_ratios, valid_ratios], -1)[:, None]
+                reference_points[:, :, None] # (bs, num_queries, 1, 4)
+                * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # (bs, 1, num_levels, 4)
             )
         else:
             assert reference_points.shape[-1] == 2
             reference_points_input = reference_points[:, :, None] * valid_ratios[:, None] 
 
         layer = self.decoder.layers[stage_id]
-        output = layer(
+        output, sampling_locations, attention_weights = layer(
             output,
             key,
             value,
@@ -773,7 +800,7 @@ class RankDetrTransformer(nn.Module):
                 new_reference_points = torch.gather(
                     new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
         
-        return output, query_pos, rank_indices, reference_points, new_reference_points
+        return output, query_pos, rank_indices, reference_points, new_reference_points, sampling_locations, attention_weights
 
         
     def cascade_stage_encoder_part(
@@ -790,7 +817,7 @@ class RankDetrTransformer(nn.Module):
         **kwargs,
     ):
         encoder_layer = self.encoder.layers[stage_id] 
-        memory = encoder_layer(
+        memory, sampling_locations, attention_weights = encoder_layer(
             query,
             key,
             value,
@@ -805,3 +832,45 @@ class RankDetrTransformer(nn.Module):
         return memory
        
         
+def attn_map_to_flat_grid(spatial_shapes, level_start_index, sampling_locations, attention_weights):
+    # sampling_locations: [N, n_layers, Len_q, n_heads, n_levels, n_points, 2]
+    # attention_weights: [N, n_layers, Len_q, n_heads, n_levels, n_points]
+    N, n_layers, Len_q, n_heads, *_ = sampling_locations.shape
+    sampling_locations = sampling_locations.permute(0, 1, 3, 2, 5, 4, 6).flatten(0, 3)
+    # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    attention_weights = attention_weights.permute(0, 1, 3, 2, 5, 4).flatten(0, 3)
+    # [N * n_layers * n_heads * Len_q, n_points, n_levels]
+
+    rev_spatial_shapes = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1) # hw -> wh (xy)
+    col_row_float = sampling_locations * rev_spatial_shapes # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    # get 4 corner integeral positions around the floating-type sampling locations. 
+    col_row_ll = col_row_float.floor().to(torch.int64) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    zero = torch.zeros(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    one = torch.ones(*col_row_ll.shape[:-1], dtype=torch.int64, device=col_row_ll.device) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+    col_row_lh = col_row_ll + torch.stack([zero, one], dim=-1)
+    col_row_hl = col_row_ll + torch.stack([one, zero], dim=-1)
+    col_row_hh = col_row_ll + 1
+    # compute magin for bilinear interpolation
+    margin_ll = (col_row_float - col_row_ll).prod(dim=-1)
+    margin_lh = -(col_row_float - col_row_lh).prod(dim=-1)
+    margin_hl = -(col_row_float - col_row_hl).prod(dim=-1)
+    margin_hh = (col_row_float - col_row_hh).prod(dim=-1) # [N * n_layers * n_heads * Len_q, n_points, n_levels, 2]
+
+    flat_grid_shape = (attention_weights.shape[0], int(torch.sum(spatial_shapes[..., 0] * spatial_shapes[..., 1]))) # [N * n_layers * n_heads * Len_q, num_all_lvl_tokens]
+    flat_grid = torch.zeros(flat_grid_shape, dtype=torch.float32, device=attention_weights.device) # [N * n_layers * n_heads * Len_q, num_all_lvl_tokens]
+
+    zipped = [(col_row_ll, margin_hh), (col_row_lh, margin_hl), (col_row_hl, margin_lh), (col_row_hh, margin_ll)]
+    for col_row, margin in zipped:
+        valid_mask = torch.logical_and(
+            torch.logical_and(col_row[..., 0] >= 0, col_row[..., 0] < rev_spatial_shapes[..., 0]),
+            torch.logical_and(col_row[..., 1] >= 0, col_row[..., 1] < rev_spatial_shapes[..., 1]),
+        )
+        #  [N * n_layers * n_heads * Len_q, n_points, n_levels] * [n_levels, ] + 
+        #  [N * n_layers * n_heads * Len_q, n_points, n_levels] + [n_levels]
+        idx = col_row[..., 1] * spatial_shapes[..., 1] + col_row[..., 0] + level_start_index
+        idx = (idx * valid_mask).flatten(1, 2)
+        weights = (attention_weights * valid_mask * margin).flatten(1)
+        flat_grid.scatter_add_(1, idx, weights)
+
+    return flat_grid.reshape(N, Len_q, n_layers, n_heads, -1).sum((2,3)).permute(0, 2, 1)
+

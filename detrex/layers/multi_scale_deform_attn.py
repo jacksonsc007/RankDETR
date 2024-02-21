@@ -323,6 +323,7 @@ class MultiScaleDeformableAttention(nn.Module):
             # references_points + sampling_offsets
             
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            # sampling_locations: [N, Len_q, n_heads, n_levels, n_points, 2]
             sampling_locations = (
                 reference_points[:, :, None, :, None, :]
                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
@@ -365,7 +366,7 @@ class MultiScaleDeformableAttention(nn.Module):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity, sampling_locations, attention_weights
 
 
 def create_dummy_class(klass, dependency, message=""):
