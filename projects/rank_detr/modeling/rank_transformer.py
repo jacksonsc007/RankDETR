@@ -547,27 +547,27 @@ class RankDetrTransformer(nn.Module):
                     **kwargs
             )
 
-            # if stage_id != (self.num_stages - 1):
-            #     # sampling_locations: [N, 1, Len_q, n_heads, n_levels, n_points, 2]
-            #     # attention_weights: [N, 1, Len_q, n_heads, n_levels, n_points]
-            #     decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
-            #     decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
-            #     N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
-            #     N, num_tokens_all_lvl, _, _ = encoder_reference_points.size()
+            if stage_id != (self.num_stages - 1):
+                # sampling_locations: [N, 1, Len_q, n_heads, n_levels, n_points, 2]
+                # attention_weights: [N, 1, Len_q, n_heads, n_levels, n_points]
+                decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
+                decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
+                N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
+                N, num_tokens_all_lvl, _, _ = encoder_reference_points.size()
 
-            #     # (N, num_all_lvl_tokens, num_decoder_queries)
-            #     decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
+                # (N, num_all_lvl_tokens, num_decoder_queries)
+                decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
 
-            #     # naive design
-            #     topk_query_idx = decoder_cross_attention_map.topk(n_levels, dim=2)[1] # (N, num_all_lvl_tokens, num_levels)
+                # naive design
+                topk_query_idx = decoder_cross_attention_map.topk(n_levels, dim=2)[1] # (N, num_all_lvl_tokens, num_levels)
 
-            #     # decoder_reference_points: (N, Len_q, 4)
-            #     # topk_predictions = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
-            #     topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
+                # decoder_reference_points: (N, Len_q, 4)
+                # topk_predictions = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
+                topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
 
-            #     # topk_predictions: (bs, num_all_lvl_tokens, num_levels, 2)
-            #     # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 2)
-            #     encoder_reference_points = topk_predictions_center * valid_ratios[:, None]
+                # topk_predictions: (bs, num_all_lvl_tokens, num_levels, 2)
+                # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 2)
+                encoder_reference_points = topk_predictions_center * valid_ratios[:, None]
 
 
 
