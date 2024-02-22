@@ -18,3 +18,28 @@ How to improve:
 1. only involve one2one queries.
 
 2. For each token in encoder, we want it to focus on <num_points> objects. So we could use topk stardard to get <num_points> prediction boxes centers and its respective projection on each feature levels.
+
+## version v3.0.2
+In this minor version, each tokens will focus on <num_points> objects, whose centers server as reference points and are initialized according to the decoder cross-attention map. The locations of each objects centers are projected to feature maps of all levels.
+
+
+### todo
+1. ⭐
+(priority-5, requires a lot of exps)
+With the instruction of decoder cross-attention map, deformable attention may equip with more keypoints and reach a higher envelop. As the references points in the original deformable detr work are locations of tokens themselves. 
+
+2. ⭐⭐⭐
+Disentangle one-to-one queries as only one-to-many queries are discarded during inference. 
+
+3. ⭐⭐⭐
+Keep the locations of tokens as one of the reference points. This setting could avoid unreliable cross-attention map in the early stages ideally. 
+
+4. ⭐⭐
+In the original Deformable DETR, the reference points of deformable attention in encoder **are same among all encoder layers**, while the reference points in decoder are refined  progressively.
+What if we use the sampling locations (reference_points + offset) of previous encoder layers as the references points of current layer? 
+
+5. ⭐⭐⭐
+reference points instructed by cross-attention map results in that  tokens have unstable regions to focus. This may cause performance drop. **Could we combine the cross-attention map of current decoder layer and all pervious ones??**
+
+6. ⭐⭐
+what if we retain the grad of object centers predicted by decoder and use them as the reference points in the deformable attention process in encoder?
