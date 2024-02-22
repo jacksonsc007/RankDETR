@@ -505,7 +505,7 @@ class RankDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
+        encoder_locations_reference_points = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
@@ -521,6 +521,7 @@ class RankDetrTransformer(nn.Module):
         init_reference_outs = []
         enc_outputs_class_all = []
         enc_outputs_coord_unact_all = []
+        encoder_reference_points = encoder_locations_reference_points
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
@@ -562,16 +563,23 @@ class RankDetrTransformer(nn.Module):
 
 
                 # naive design
-                topk_query_idx = decoder_cross_attention_map.topk(n_points, dim=2)[1] # (N, num_all_lvl_tokens, n_points)
+                topk_query_idx = decoder_cross_attention_map.topk(n_points-1, dim=2)[1] # (N, num_all_lvl_tokens, n_points)
 
                 # decoder_reference_points: (N, Len_q, 4)
                 topk_predictions_center = decoder_predictions[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
                 # topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
 
-                # topk_predictions: (bs, num_all_lvl_tokens, n_points, 2) ->  (bs, num_all_lvl_tokens, 1, n_points, 2)
+                # topk_predictions: (bs, num_all_lvl_tokens, n_points-1, 2) ->  (bs, num_all_lvl_tokens, 1, n_points-1, 2)
                 # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 1, 2)
-                # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 2)
-                encoder_reference_points = topk_predictions_center.unsqueeze(2) * valid_ratios[:, None, :, None, :] # all levels share same points now
+                # ->  (bs, num_all_lvl_tokens, num_levels, n_points-1, 2)
+                topk_predictions_center = topk_predictions_center.unsqueeze(2) * valid_ratios[:, None, :, None, :] # all levels share same points now
+                # encoder_locations_reference_points: (bs, num_all_lvl_tokens, num_level, 2)
+                encoder_reference_points = torch.cat([
+                    encoder_locations_reference_points.unsqueeze(3),
+                    topk_predictions_center
+                ], dim=3)
+
+
 
 
 

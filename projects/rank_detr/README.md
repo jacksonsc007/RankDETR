@@ -46,3 +46,8 @@ what if we retain the grad of object centers predicted by decoder and use them a
 
 ## version v3.0.3
 we only use one-to-one queries.
+
+**results show that this won't help.**
+
+## version v3.0.4
+The locations of tokens themselves serve as one of the reference points.
