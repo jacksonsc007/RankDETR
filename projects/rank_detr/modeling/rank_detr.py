@@ -171,6 +171,8 @@ class RankDETR(nn.Module):
             ])
             for m in self.rank_adaptive_classhead_emb.parameters():
                 nn.init.zeros_(m)
+        self.transformer.num_queries_one2one = self.num_queries_one2one
+        
 
     def forward(self, batched_inputs):
         images = self.preprocess_image(batched_inputs) # shape (4,3,H,W)

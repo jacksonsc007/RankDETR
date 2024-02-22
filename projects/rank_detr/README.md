@@ -43,3 +43,6 @@ reference points instructed by cross-attention map results in that  tokens have 
 
 6. ⭐⭐
 what if we retain the grad of object centers predicted by decoder and use them as the reference points in the deformable attention process in encoder?
+
+## version v3.0.3
+we only use one-to-one queries.
