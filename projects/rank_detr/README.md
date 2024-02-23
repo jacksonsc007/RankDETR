@@ -50,4 +50,4 @@ we only use one-to-one queries.
 **results show that this won't help.**
 
 ## version v3.0.4
-The locations of tokens themselves serve as one of the reference points.
+The locations of tokens themselves serve as one of the reference points. Both one2one and one2many queries are used.

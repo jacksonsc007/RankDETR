@@ -551,10 +551,9 @@ class RankDetrTransformer(nn.Module):
             if stage_id != (self.num_stages - 1):
                 # sampling_locations: [N, 1, Len_q, n_heads, n_levels, n_points, 2]
                 # attention_weights: [N, 1, Len_q, n_heads, n_levels, n_points]
-                # only use one-to-one queries
-                decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()[:, :, :self.num_queries_one2one]
-                decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()[:, :, :self.num_queries_one2one]
-                decoder_predictions = decoder_reference_points[:, :self.num_queries_one2one]
+                decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
+                decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
+                decoder_predictions = decoder_reference_points
                 N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
                 num_tokens_all_lvl = encoder_reference_points.size(1)
 
