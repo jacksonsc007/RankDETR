@@ -51,3 +51,32 @@ we only use one-to-one queries.
 
 ## version v3.0.4
 The locations of tokens themselves serve as one of the reference points. Both one2one and one2many queries are used.
+
+**results show that this won't help.**
+
+### todo
+Follow IMFA to improve:
+1. ⭐⭐⭐
+
+Instead of using cross-attention map to search reference points, we directly use classfication scores of box predictions.
+
+First, use topk class score criterion to select potential objects, then select <n_points> object centers nearest to tokens.
+
+2. ⭐⭐⭐
+sample keypoints within each predicted boxes, predict offsets with respect to box range. use dot-product to produce attention weights.
+
+3. ⭐⭐⭐
+
+use object queries, instead of feature tokens, to predict sampling offsets or attetion weights.
+
+4. ⭐⭐⭐
+experiemnts to do: only salient tokens as keys.
+
+5. ⭐⭐⭐
+make use of the sampling locations of decoder to facilitate the keypoints sampling of encoder.
+
+## version v3.0.5
+In this version, we use the cumulative cross-attention map.
+
+**results show that this won't help.**
+
