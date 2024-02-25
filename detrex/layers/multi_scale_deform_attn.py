@@ -320,7 +320,7 @@ class MultiScaleDeformableAttention(nn.Module):
         if reference_points.ndim == 4:
             reference_points = reference_points[:, :, None, :, None, :]
         else:
-            assert reference_points.size() == torch.Size([N, Len_q, n_levels, n_points, 2]) 
+            assert reference_points.size() == torch.Size([N, Len_q, n_levels, 1, 2]) 
             reference_points = reference_points[:, :, None] # add heads dimension
         
         # bs, num_query, num_heads, num_levels, num_points, 2

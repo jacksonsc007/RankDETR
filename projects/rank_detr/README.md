@@ -80,3 +80,8 @@ In this version, we use the cumulative cross-attention map.
 
 **results show that this won't help.**
 
+
+## version v3.0.6
+Each feature token focus on only one object now, instead of <num_points> objects in previous version.
+
+**results show that this won't help.** The reason for that may be the unreliable attention weights and sampling offsets predicted by token far away from the reference points.
