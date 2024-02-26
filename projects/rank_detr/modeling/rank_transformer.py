@@ -559,16 +559,16 @@ class RankDetrTransformer(nn.Module):
                 decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
 
                 # each token focuses on one object
-                topk_query_idx = decoder_cross_attention_map.topk(1, dim=2)[1] # (N, num_all_lvl_tokens, n_points)
+                n_objs = 1
+                topk_query_idx = decoder_cross_attention_map.topk(n_objs, dim=2)[1] # (N, num_all_lvl_tokens, n_objs)
 
                 # decoder_reference_points: (N, Len_q, 4)
-                topk_predictions_center = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
-                # topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
+                topk_predictions_center = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4).gather(2, topk_query_idx[..., None].repeat(1, 1, 1, 4))
 
-                # topk_predictions: (bs, num_all_lvl_tokens, n_points, 2) ->  (bs, num_all_lvl_tokens, 1, n_points, 2)
-                # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 1, 2)
-                # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 2)
-                encoder_reference_points = topk_predictions_center.unsqueeze(2) * valid_ratios[:, None, :, None, :] # all levels share same points now
+                # topk_predictions_center: (bs, num_all_lvl_tokens, n_points, 4) ->  (bs, num_all_lvl_tokens, 1, n_points, 4)
+                # valid_ratios: (bs, num_levels, 2) -> (bs, num_levels, 4) -> (bs, 1 , num_levels, 1, 4)
+                # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 4)
+                encoder_reference_points = topk_predictions_center.unsqueeze(2) * torch.cat([valid_ratios, valid_ratios], dim=-1)[:, None, :, None, :] # all levels share same points now
 
 
 

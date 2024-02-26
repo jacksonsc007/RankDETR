@@ -85,3 +85,9 @@ In this version, we use the cumulative cross-attention map.
 Each feature token focus on only one object now, instead of <num_points> objects in previous version.
 
 **results show that this won't help.** The reason for that may be the unreliable attention weights and sampling offsets predicted by token far away from the reference points.
+
+
+# version v3.1
+As of this major version, we select the whole box predictions from decoder as the reference "points" for encoder, which is as same as the decoder deformable attention. In the source code of `MultiScaleDeformableAttention`, there are two forms of reference points. For encoder, the reference point is defined as (x, y), which is the location of token itself. And for decoder, the reference point is defined as (x, y, w, h), which is the box prediction from encoder (two-stage scheme) or previous decoder layer. **For clarity**, we call the (x, y) and (x, y, w, h) forms as `reference point` and `reference box`, respectively.
+
+We adhere to the philosophy proposed in v3.0 serires, but modify reference points to reference boxes. 
