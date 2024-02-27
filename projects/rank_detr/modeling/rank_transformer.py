@@ -331,6 +331,7 @@ class RankDetrTransformer(nn.Module):
         two_stage_num_proposals=300,
         mixed_selection=True,
         rank_adaptive_classhead=True,
+        attn_weight_thr=0.1,
     ):
         super(RankDetrTransformer, self).__init__()
         self.encoder = encoder
@@ -358,6 +359,7 @@ class RankDetrTransformer(nn.Module):
         assert self.encoder.num_layers == self.decoder.num_layers, \
         "symmetric encoder decoders design is now required."
         self.num_stages = self.encoder.num_layers
+        self.attn_weight_thr = attn_weight_thr
 
     def init_weights(self):
         for p in self.parameters():
@@ -505,10 +507,11 @@ class RankDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
+        fixed_encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
+        num_tokens_all_lvl = fixed_encoder_reference_points.size(1)
 
         memory = feat_flatten # init memory
         decoder_query = None
@@ -521,6 +524,7 @@ class RankDetrTransformer(nn.Module):
         init_reference_outs = []
         enc_outputs_class_all = []
         enc_outputs_coord_unact_all = []
+        encoder_reference_points = fixed_encoder_reference_points
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
@@ -553,22 +557,39 @@ class RankDetrTransformer(nn.Module):
                 decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
                 decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
                 N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
-                num_tokens_all_lvl = encoder_reference_points.size(1)
 
                 # (N, num_all_lvl_tokens, num_decoder_queries)
                 decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
+                max_attn_weight, max_query_idx = decoder_cross_attention_map.max(dim=2)
+                # max_attn_weight2, max_query_idx2 = decoder_cross_attention_map[:, :, :self.num_queries_one2one].max(dim=2)
+                new_enc_refs = []
+                for img_id in range(N):
+                    object_token_idx = (max_attn_weight[img_id] > self.attn_weight_thr).nonzero().squeeze(1)
+                    # object_token_idx2 = (max_attn_weight2[img_id] > 0).nonzero().squeeze(1)
 
-                # each token focuses on one object
-                topk_query_idx = decoder_cross_attention_map.topk(1, dim=2)[1] # (N, num_all_lvl_tokens, n_points)
+                    # valid_ratio1 = len(object_token_idx) / num_tokens_all_lvl
+                    # valid_ratio2 = len(object_token_idx2) / num_tokens_all_lvl
+                    
+                    if len(object_token_idx) !=0:
+                        valid_obj_query_idx = (max_query_idx[img_id])[object_token_idx]
+                        # encoder_reference_points[0]: (num_all_lvl_tokens, num_levels, 2)
+                        # decoder_reference_points: (N, Len_q, 4)
+                        per_img_dec_ref_center = (decoder_reference_points[img_id]).unsqueeze(dim=1).repeat(1, n_levels, 1)[..., :2] # (Len_q, n_levels, 2)
+                        new_enc_refs.append( 
+                            fixed_encoder_reference_points[img_id].scatter(
+                            dim=0, 
+                            index=object_token_idx[:, None, None].repeat(1, n_levels, 2), # (num_object_token, n_levels, 2)
+                            src=per_img_dec_ref_center[valid_obj_query_idx]
+                            )
+                        )
+                    else:
+                        new_enc_refs.append(fixed_encoder_reference_points[img_id])
+                new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 2)
 
-                # decoder_reference_points: (N, Len_q, 4)
-                topk_predictions_center = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
-                # topk_predictions_center = decoder_reference_points[:, None].repeat(1, num_tokens_all_lvl, 1, 1)[..., :2].gather(1, topk_query_idx[..., None].repeat(1, 1, 1, 2))
-
-                # topk_predictions: (bs, num_all_lvl_tokens, n_points, 2) ->  (bs, num_all_lvl_tokens, 1, n_points, 2)
+                # new_enc_refs: (bs, num_all_lvl_tokens, n_levels, 2) ->  (bs, num_all_lvl_tokens, n_levels, 1, 2)
                 # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 1, 2)
                 # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 2)
-                encoder_reference_points = topk_predictions_center.unsqueeze(2) * valid_ratios[:, None, :, None, :] # all levels share same points now
+                encoder_reference_points = new_enc_refs.unsqueeze(3) * valid_ratios[:, None, :, None, :] # all levels share same points now
 
 
 

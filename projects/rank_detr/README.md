@@ -85,3 +85,10 @@ In this version, we use the cumulative cross-attention map.
 Each feature token focus on only one object now, instead of <num_points> objects in previous version.
 
 **results show that this won't help.** The reason for that may be the unreliable attention weights and sampling offsets predicted by token far away from the reference points.
+
+### bug fixing and improvement
+The original v3.0.6 set the wrong  `dim` argument of `torch.gather`. We fixed it in this version.
+
+Due to the sparse form of object queries, most feature tokens will receive 0 or fairly small attention weights, which is not adequate to manifest a strong relation between them. To fix this, we add one more `attention weight threshold` to filter out unreliable false relation.
+
+**Results show that this will help. :)** 
