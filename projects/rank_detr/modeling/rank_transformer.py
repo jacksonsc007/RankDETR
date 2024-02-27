@@ -331,6 +331,7 @@ class RankDetrTransformer(nn.Module):
         two_stage_num_proposals=300,
         mixed_selection=True,
         rank_adaptive_classhead=True,
+        attn_weight_thr=0.1,
     ):
         super(RankDetrTransformer, self).__init__()
         self.encoder = encoder
@@ -358,6 +359,7 @@ class RankDetrTransformer(nn.Module):
         assert self.encoder.num_layers == self.decoder.num_layers, \
         "symmetric encoder decoders design is now required."
         self.num_stages = self.encoder.num_layers
+        self.attn_weight_thr = attn_weight_thr
 
     def init_weights(self):
         for p in self.parameters():
@@ -389,7 +391,7 @@ class RankDetrTransformer(nn.Module):
 
             scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N, 1, 1, 2) # (N, 1, 1, 2)
             grid = (grid.unsqueeze(0).expand(N, -1, -1, -1) + 0.5) / scale # (1, H, W, 2) -> (N, H, W, 2) 
-            wh = torch.ones_like(grid) * 0.05 * (2.0**lvl) # Appendix A.4 in deformable-detr
+            wh = torch.ones_like(grid) * 0.05 * (2.0**lvl) # Appendix A.4 in deformable-detr. w and h is relative to real size.
             proposal = torch.cat((grid, wh), -1).view(N, -1, 4) # proposal representation: normalized (c_x, c_y, w, h)
             proposals.append(proposal)
             _cur += H * W
@@ -437,10 +439,12 @@ class RankDetrTransformer(nn.Module):
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H) # (1, h*w) / (bs, 1) -> (bs, h*w)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
             ref = torch.stack((ref_x, ref_y), -1) # (bs, h*w, 2)
+            wh = torch.ones_like(ref) * 0.05 * (2.0**lvl) # relative to real size
+            ref = torch.cat([ref, wh], dim=2)
             reference_points_list.append(ref)
         reference_points = torch.cat(reference_points_list, 1)
-        reference_points = reference_points[:, :, None] * valid_ratios[:, None] # (bs,all_lvl_num, 1, 2) * (bs, 1, num_lvl, 2)
-        return reference_points
+        reference_points = reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None] # (bs,all_lvl_num, 1, 4) * (bs, 1, num_lvl, 4)
+        return reference_points[..., :2], reference_points
 
     def get_valid_ratio(self, mask):
         """Get the valid radios of feature maps of all  level."""
@@ -505,7 +509,7 @@ class RankDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
+        fixed_encoder_reference_points, fixed_encoder_reference_boxes = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
@@ -515,6 +519,9 @@ class RankDetrTransformer(nn.Module):
         decoder_query_pos = None
         decoder_reference_points = None
         rank_indices = None
+        encoder_reference_points = fixed_encoder_reference_points
+        num_tokens_all_lvl = encoder_reference_points.size(1)
+
 
         inter_states = []
         inter_references = []
@@ -553,25 +560,39 @@ class RankDetrTransformer(nn.Module):
                 decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
                 decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
                 N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
-                num_tokens_all_lvl = encoder_reference_points.size(1)
 
                 # (N, num_all_lvl_tokens, num_decoder_queries)
                 decoder_cross_attention_map = attn_map_to_flat_grid(spatial_shapes, level_start_index, decoder_sampling_locations, decoder_attention_weights)
+                
+                max_attn_weight, max_query_idx = decoder_cross_attention_map.max(dim=2)
+                # max_attn_weight2, max_query_idx2 = decoder_cross_attention_map[:, :, :self.num_queries_one2one].max(dim=2)
+                new_enc_refs = []
+                for img_id in range(N):
+                    object_token_idx = (max_attn_weight[img_id] > self.attn_weight_thr).nonzero().squeeze(1)
+                    # object_token_idx2 = (max_attn_weight2[img_id] > 0).nonzero().squeeze(1)
 
-                # each token focuses on one object
-                n_objs = 1
-                topk_query_idx = decoder_cross_attention_map.topk(n_objs, dim=2)[1] # (N, num_all_lvl_tokens, n_objs)
-
-                # decoder_reference_points: (N, Len_q, 4)
-                topk_predictions_center = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4).gather(2, topk_query_idx[..., None].repeat(1, 1, 1, 4))
-
-                # topk_predictions_center: (bs, num_all_lvl_tokens, n_points, 4) ->  (bs, num_all_lvl_tokens, 1, n_points, 4)
-                # valid_ratios: (bs, num_levels, 2) -> (bs, num_levels, 4) -> (bs, 1 , num_levels, 1, 4)
-                # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 4)
-                encoder_reference_points = topk_predictions_center.unsqueeze(2) * torch.cat([valid_ratios, valid_ratios], dim=-1)[:, None, :, None, :] # all levels share same points now
-
-
-
+                    # valid_ratio1 = len(object_token_idx) / num_tokens_all_lvl
+                    # valid_ratio2 = len(object_token_idx2) / num_tokens_all_lvl
+                    
+                    if len(object_token_idx) !=0:
+                        valid_obj_query_idx = (max_query_idx[img_id])[object_token_idx]
+                        # encoder_reference_boxes[0]: (num_all_lvl_tokens, num_levels, 4)
+                        # decoder_reference_points: (N, Len_q, 4)
+                        per_img_dec_ref_box = (decoder_reference_points[img_id]).unsqueeze(dim=1).repeat(1, n_levels, 1) # (Len_q, n_levels, 4)
+                        # convert ref from real image range to batched image range
+                        valid_ratio_per = valid_ratios[img_id]
+                        per_img_dec_ref_box = per_img_dec_ref_box * (torch.cat([valid_ratio_per, valid_ratio_per], -1))[None] # (Len_q, n_levels, 4) * (1, n_levels, 4)
+                        new_enc_refs.append( 
+                            fixed_encoder_reference_boxes[img_id].scatter(
+                            dim=0, 
+                            index=object_token_idx[:, None, None].repeat(1, n_levels, 4), # (num_object_token, n_levels, 4)
+                            src=per_img_dec_ref_box[valid_obj_query_idx]
+                            )
+                        )
+                    else:
+                        new_enc_refs.append(fixed_encoder_reference_boxes[img_id])
+                new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 4)
+                encoder_reference_points = new_enc_refs.unsqueeze(3)
 
             # assert decoder_reference_points.requires_grad == False
             inter_states.append(decoder_query)

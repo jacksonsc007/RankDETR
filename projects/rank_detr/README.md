@@ -91,3 +91,8 @@ Each feature token focus on only one object now, instead of <num_points> objects
 As of this major version, we select the whole box predictions from decoder as the reference "points" for encoder, which is as same as the decoder deformable attention. In the source code of `MultiScaleDeformableAttention`, there are two forms of reference points. For encoder, the reference point is defined as (x, y), which is the location of token itself. And for decoder, the reference point is defined as (x, y, w, h), which is the box prediction from encoder (two-stage scheme) or previous decoder layer. **For clarity**, we call the (x, y) and (x, y, w, h) forms as `reference point` and `reference box`, respectively.
 
 We adhere to the philosophy proposed in v3.0 serires, but modify reference points to reference boxes. 
+
+## bug-fixing branch
+As same as the bug-fixing branch of version 3.0.6, we add `attn_weight_thr` to eliminate tokens receiving too small attention weights. In addition:
+
+we expand the `reference points` to `reference box`. We add the `w`and `h` to the original featurn token reference point to form the reference box, following the design of function `gen_encoder_output_proposals` which generate proposals from encoder to initialize decoder `reference box`. Please refer to function `get_reference_points` for details.
