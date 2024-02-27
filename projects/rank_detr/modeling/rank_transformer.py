@@ -515,6 +515,7 @@ class RankDetrTransformer(nn.Module):
         decoder_query_pos = None
         decoder_reference_points = None
         rank_indices = None
+        encoder_reference_object_query = None
 
         inter_states = []
         inter_references = []
@@ -544,6 +545,7 @@ class RankDetrTransformer(nn.Module):
                     level_start_index=level_start_index,
                     valid_ratios=valid_ratios,
                     rank_indices=rank_indices,
+                    encoder_reference_object_query=encoder_reference_object_query,
                     **kwargs
             )
 
@@ -563,12 +565,23 @@ class RankDetrTransformer(nn.Module):
                 topk_query_idx = decoder_cross_attention_map.topk(n_objs, dim=2)[1] # (N, num_all_lvl_tokens, n_objs)
 
                 # decoder_reference_points: (N, Len_q, 4)
-                topk_predictions_center = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4).gather(2, topk_query_idx[..., None].repeat(1, 1, 1, 4))
+                # decoder_query: (N, Len_q, 256)
+                topk_prediction_box = decoder_reference_points[:, None].expand(N, num_tokens_all_lvl, Len_q, 4).gather(2, topk_query_idx[..., None].repeat(1, 1, 1, 4))
+                feat_c = decoder_query.size(-1)
+                topk_object_query = decoder_query[:, None].expand(N, num_tokens_all_lvl, Len_q, feat_c).gather(2, topk_query_idx[..., None].repeat(1, 1, 1, feat_c))
+                
+                # only 1 object for now
+                topk_object_query = topk_object_query.squeeze(dim=2)
 
                 # topk_predictions_center: (bs, num_all_lvl_tokens, n_points, 4) ->  (bs, num_all_lvl_tokens, 1, n_points, 4)
                 # valid_ratios: (bs, num_levels, 2) -> (bs, num_levels, 4) -> (bs, 1 , num_levels, 1, 4)
                 # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 4)
-                encoder_reference_points = topk_predictions_center.unsqueeze(2) * torch.cat([valid_ratios, valid_ratios], dim=-1)[:, None, :, None, :] # all levels share same points now
+                encoder_reference_points = topk_prediction_box.unsqueeze(2) * torch.cat([valid_ratios, valid_ratios], dim=-1)[:, None, :, None, :] # all levels share same points now
+
+                # TODO keep gradient
+                encoder_reference_object_query = topk_object_query.detach()
+
+
 
 
 
@@ -761,6 +774,7 @@ class RankDetrTransformer(nn.Module):
             query_key_padding_mask=query_key_padding_mask,
             key_padding_mask=key_padding_mask,
             reference_points=reference_points_input,
+            attention_location="decoder",
             **kwargs,
         )
 
@@ -826,6 +840,7 @@ class RankDetrTransformer(nn.Module):
             attn_masks=attn_masks,
             query_key_padding_mask=query_key_padding_mask,
             key_padding_mask=key_padding_mask,
+            attention_location="encoder",
             **kwargs, 
         )
         if stage_id == (self.num_stages - 1) and self.encoder.post_norm_layer is not None :

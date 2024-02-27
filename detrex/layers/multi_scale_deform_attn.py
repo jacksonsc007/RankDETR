@@ -297,14 +297,30 @@ class MultiScaleDeformableAttention(nn.Module):
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
+
         # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
-        sampling_offsets = self.sampling_offsets(query).view( #NOTE the way to generate offsets for every head and every query
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
-        )
-        # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
-        attention_weights = self.attention_weights(query).view( #NOTE the way to genereate attention weight.
-            bs, num_query, self.num_heads, self.num_levels * self.num_points # we need to normalize attention weight among 4 sampling points for 4 levels.
-        )
+        # ink added
+        encoder_reference_object_query = kwargs.get("encoder_reference_object_query", None)
+        location = kwargs.get("attention_location", None)
+        if (encoder_reference_object_query is not None) and (location == "encoder"):
+            if not self.batch_first:
+                encoder_reference_object_query = encoder_reference_object_query.permute(1, 0, 2)
+            sampling_offsets = self.sampling_offsets(encoder_reference_object_query).view( #NOTE the way to generate offsets for every head and every query
+                bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+            )
+            # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
+            attention_weights = self.attention_weights(encoder_reference_object_query).view( #NOTE the way to genereate attention weight.
+                bs, num_query, self.num_heads, self.num_levels * self.num_points # we need to normalize attention weight among 4 sampling points for 4 levels.
+            )
+        else:
+            sampling_offsets = self.sampling_offsets(query).view( #NOTE the way to generate offsets for every head and every query
+                bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
+            )
+            # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
+            attention_weights = self.attention_weights(query).view( #NOTE the way to genereate attention weight.
+                bs, num_query, self.num_heads, self.num_levels * self.num_points # we need to normalize attention weight among 4 sampling points for 4 levels.
+            )
+
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
             bs,
