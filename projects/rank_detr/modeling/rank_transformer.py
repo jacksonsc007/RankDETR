@@ -331,7 +331,7 @@ class RankDetrTransformer(nn.Module):
         two_stage_num_proposals=300,
         mixed_selection=True,
         rank_adaptive_classhead=True,
-        attn_weight_thr=0.1,
+        attn_weight_thr=0,
     ):
         super(RankDetrTransformer, self).__init__()
         self.encoder = encoder
@@ -552,10 +552,10 @@ class RankDetrTransformer(nn.Module):
             )
 
             if stage_id != (self.num_stages - 1):
-                # sampling_locations: [N, 1, Len_q, n_heads, n_levels, n_points, 2]
-                # attention_weights: [N, 1, Len_q, n_heads, n_levels, n_points]
-                decoder_sampling_locations = decoder_sampling_locations.unsqueeze(1).detach()
-                decoder_attention_weights = decoder_attention_weights.unsqueeze(1).detach()
+                # sampling_locations: [N, 1, num_queries_one2one, n_heads, n_levels, n_points, 2]
+                # attention_weights: [N, 1, num_queries_one2one, n_heads, n_levels, n_points]
+                decoder_sampling_locations = decoder_sampling_locations[:, :self.num_queries_one2one].unsqueeze(1).detach()
+                decoder_attention_weights = decoder_attention_weights[:, :self.num_queries_one2one].unsqueeze(1).detach()
                 N, _, Len_q, n_heads, n_levels, n_points, _ = decoder_sampling_locations.size()
 
                 # (N, num_all_lvl_tokens, num_decoder_queries)
@@ -575,6 +575,9 @@ class RankDetrTransformer(nn.Module):
                         # encoder_reference_points[0]: (num_all_lvl_tokens, num_levels, 2)
                         # decoder_reference_points: (N, Len_q, 4)
                         per_img_dec_ref_center = (decoder_reference_points[img_id]).unsqueeze(dim=1).repeat(1, n_levels, 1)[..., :2] # (Len_q, n_levels, 2)
+                        # real size to padding size
+                        per_valid_ratio = valid_ratios[img_id]
+                        per_img_dec_ref_center = per_img_dec_ref_center * per_valid_ratio[None] # (Len_q, n_levels, 2)
                         new_enc_refs.append( 
                             fixed_encoder_reference_points[img_id].scatter(
                             dim=0, 
@@ -584,13 +587,7 @@ class RankDetrTransformer(nn.Module):
                         )
                     else:
                         new_enc_refs.append(fixed_encoder_reference_points[img_id])
-                new_enc_refs = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 2)
-
-                # new_enc_refs: (bs, num_all_lvl_tokens, n_levels, 2) ->  (bs, num_all_lvl_tokens, n_levels, 1, 2)
-                # valid_ratios: (bs, num_levels, 2) -> (bs, 1 , num_levels, 1, 2)
-                # ->  (bs, num_all_lvl_tokens, num_levels, n_points, 2)
-                encoder_reference_points = new_enc_refs.unsqueeze(3) * valid_ratios[:, None, :, None, :] # all levels share same points now
-
+                encoder_reference_points = torch.stack(new_enc_refs, dim=0) # (N, num_all_lvl_tokens, n_levels, 2)
 
 
 

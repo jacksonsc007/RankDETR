@@ -49,7 +49,7 @@ model.transformer.decoder.query_rank_layer = True
 model.criterion.GIoU_aware_class_loss = True
 model.criterion.matcher.iou_order_alpha = 4.0
 model.criterion.matcher.matcher_change_iter = 67500
-model.transformer.attn_weight_thr = 0.1
+model.transformer.attn_weight_thr = 0
 
 
 model_code = f"CascadeRankDETR_twostage_one2one{model.num_queries_one2one}one2many{model.num_queries_one2many}_enc{model.transformer.encoder.num_layers}_dec{model.transformer.decoder.num_layers}_attn_weight_thr{model.transformer.attn_weight_thr}"

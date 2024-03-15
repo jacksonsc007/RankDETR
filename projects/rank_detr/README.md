@@ -92,3 +92,8 @@ The original v3.0.6 set the wrong  `dim` argument of `torch.gather`. We fixed it
 Due to the sparse form of object queries, most feature tokens will receive 0 or fairly small attention weights, which is not adequate to manifest a strong relation between them. To fix this, we add one more `attention weight threshold` to filter out unreliable false relation.
 
 **Results show that this will help. :)** 
+
+
+## bug-fixing: v3.0.6.1
+1. only use one2one queries
+2. set attention weight threshold to 0
