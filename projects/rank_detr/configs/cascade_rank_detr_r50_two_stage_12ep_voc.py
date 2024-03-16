@@ -77,14 +77,14 @@ train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
 # max training iterations
 train.max_iter = int( num_epochs * total_imgs / batch_size)
 
-# run evaluation every epoch
-train.eval_period = iters_per_epoch
-
 # log training infomation every 20 iters
 train.log_period = 20
 
 # save checkpoint every epoch
-train.checkpointer.period = iters_per_epoch
+train.checkpointer.period = (int(iters_per_epoch / train.log_period) + 1) * train.log_period # tmp workaround for bug in wandbwriter
+
+# run evaluation every epoch
+train.eval_period = (int(iters_per_epoch / train.log_period) + 1) * train.log_period # tmp workaround for bug in wandbwriter
 
 # gradient clipping for training
 train.clip_grad.enabled = True
