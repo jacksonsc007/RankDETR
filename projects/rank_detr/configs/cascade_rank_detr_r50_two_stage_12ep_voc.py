@@ -14,7 +14,7 @@ batch_size = 4
 total_imgs = 16651
 num_epochs = 12
 assert num_epochs == 12
-
+iters_per_epoch = int(total_imgs/batch_size)
 setting_code = f"bs{batch_size}_epoch{num_epochs}"
 
 # ========================================
@@ -75,14 +75,14 @@ train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
 # max training iterations
 train.max_iter = int( num_epochs * total_imgs / batch_size)
 
-# run evaluation every 5000 iters
-train.eval_period = 5000
-
 # log training infomation every 20 iters
 train.log_period = 20
 
-# save checkpoint every 5000 iters
-train.checkpointer.period = 5000
+# save checkpoint every epoch
+train.checkpointer.period = (int(iters_per_epoch / train.log_period) + 1) * train.log_period # tmp workaround for bug in wandbwriter
+
+# run evaluation every epoch
+train.eval_period = (int(iters_per_epoch / train.log_period) + 1) * train.log_period # tmp workaround for bug in wandbwriter
 
 # gradient clipping for training
 train.clip_grad.enabled = True

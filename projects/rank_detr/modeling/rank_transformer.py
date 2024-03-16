@@ -30,7 +30,7 @@ from detrex.utils import inverse_sigmoid
 from fairscale.nn.checkpoint import checkpoint_wrapper
 
 
-class RankDetrTransformerEncoder(TransformerLayerSequence):
+class RankDetrTransformerEncoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -43,9 +43,15 @@ class RankDetrTransformerEncoder(TransformerLayerSequence):
         num_feature_levels: int = 4,
         use_checkpoint: bool = True,
     ):
-        super(RankDetrTransformerEncoder, self).__init__(
+        super(RankDetrTransformerEncoder, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.layer_location = "encoder"
+        for layer_idx in range(num_layers):
             transformer_layers=BaseTransformerLayer(
                 attn=MultiScaleDeformableAttention(
+                    layer_idx=layer_idx,
+                    layer_location=self.layer_location,
                     embed_dim=embed_dim,
                     num_heads=num_heads,
                     dropout=attn_dropout,
@@ -61,9 +67,9 @@ class RankDetrTransformerEncoder(TransformerLayerSequence):
                 ),
                 norm=nn.LayerNorm(embed_dim),
                 operation_order=("self_attn", "norm", "ffn", "norm"),
-            ),
-            num_layers=num_layers,
-        )
+            )
+            self.layers.append(transformer_layers)
+
         self.embed_dim = self.layers[0].embed_dim
         self.pre_norm = self.layers[0].pre_norm
 
@@ -107,7 +113,7 @@ class RankDetrTransformerEncoder(TransformerLayerSequence):
         return query
 
 
-class RankDetrTransformerDecoder(TransformerLayerSequence):
+class RankDetrTransformerDecoder(nn.Module):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -126,7 +132,11 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
         rank_adaptive_classhead=True,
         query_rank_layer=True,
     ):
-        super(RankDetrTransformerDecoder, self).__init__(
+        super(RankDetrTransformerDecoder, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+        self.layer_location = "decoder"
+        for layer_idx in range(num_layers):
             transformer_layers=BaseTransformerLayer(
                 attn=[
                     MultiheadAttention(
@@ -136,6 +146,8 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                         batch_first=True,
                     ),
                     MultiScaleDeformableAttention(
+                        layer_idx=layer_idx,
+                        layer_location=self.layer_location,
                         embed_dim=embed_dim,
                         num_heads=num_heads,
                         dropout=attn_dropout,
@@ -158,9 +170,8 @@ class RankDetrTransformerDecoder(TransformerLayerSequence):
                     "ffn",
                     "norm",
                 ),
-            ),
-            num_layers=num_layers,
-        )
+            )
+            self.layers.append(transformer_layers)
         self.return_intermediate = return_intermediate
 
         self.bbox_embed = None
@@ -505,7 +516,7 @@ class RankDetrTransformer(nn.Module):
         )
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1) # images have invalid feature locations in feature maps, due to padding for batching.
 
-        encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
+        fixed_encoder_reference_points = self.get_reference_points( # TODO why twice ratio?
             spatial_shapes, valid_ratios, device=feat.device
         )
 
@@ -515,6 +526,7 @@ class RankDetrTransformer(nn.Module):
         decoder_query_pos = None
         decoder_reference_points = None
         rank_indices = None
+        encoder_reference_points = fixed_encoder_reference_points
 
         inter_states = []
         inter_references = []
@@ -524,7 +536,8 @@ class RankDetrTransformer(nn.Module):
         for stage_id in range(self.num_stages):
             memory, decoder_query, decoder_query_pos,\
             rank_indices, decoder_reference_points, new_reference_points, init_reference_out, \
-            enc_outputs_class, enc_outputs_coord_unact = \
+            enc_outputs_class, enc_outputs_coord_unact, \
+            encoder_sampling_location= \
                 self.cascade_stage(
                     stage_id=stage_id,
                     encoder_query=memory,
@@ -545,6 +558,7 @@ class RankDetrTransformer(nn.Module):
                     rank_indices=rank_indices,
                     **kwargs
             )
+            encoder_reference_points = encoder_sampling_location
 
             # assert decoder_reference_points.requires_grad == False
             inter_states.append(decoder_query)
@@ -591,7 +605,7 @@ class RankDetrTransformer(nn.Module):
         rank_indices,
         **kwargs
     ):
-        memory = self.cascade_stage_encoder_part(
+        memory, encoder_sampling_location = self.cascade_stage_encoder_part(
             stage_id,
             query=encoder_query,
             key=encoder_key,
@@ -670,7 +684,8 @@ class RankDetrTransformer(nn.Module):
 
         return ( memory, decoder_query, decoder_query_pos, rank_indices, \
                  decoder_reference_points, new_reference_points, init_reference_out,\
-                 enc_outputs_class, enc_outputs_coord_unact)
+                 enc_outputs_class, enc_outputs_coord_unact,
+                 encoder_sampling_location)
     
     def cascade_stage_decoder_part(
         self,
@@ -723,7 +738,7 @@ class RankDetrTransformer(nn.Module):
             reference_points_input = reference_points[:, :, None] * valid_ratios[:, None] 
 
         layer = self.decoder.layers[stage_id]
-        output = layer(
+        output, _ = layer(
             output,
             key,
             value,
@@ -790,7 +805,7 @@ class RankDetrTransformer(nn.Module):
         **kwargs,
     ):
         encoder_layer = self.encoder.layers[stage_id] 
-        memory = encoder_layer(
+        memory, sampling_location = encoder_layer(
             query,
             key,
             value,
@@ -798,10 +813,11 @@ class RankDetrTransformer(nn.Module):
             attn_masks=attn_masks,
             query_key_padding_mask=query_key_padding_mask,
             key_padding_mask=key_padding_mask,
+            layer_location="encoder",
             **kwargs, 
         )
         if stage_id == (self.num_stages - 1) and self.encoder.post_norm_layer is not None :
             memory = self.encoder.post_norm_layer(memory)
-        return memory
+        return memory, sampling_location
        
         

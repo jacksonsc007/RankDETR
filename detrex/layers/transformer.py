@@ -152,7 +152,7 @@ class BaseTransformerLayer(nn.Module):
         for layer in self.operation_order:
             if layer == "self_attn":
                 temp_key = temp_value = query
-                query = self.attentions[attn_index](
+                query, sampling_location = self.attentions[attn_index](
                     query,
                     temp_key,
                     temp_value,
@@ -171,7 +171,7 @@ class BaseTransformerLayer(nn.Module):
                 norm_index += 1
 
             elif layer == "cross_attn":
-                query = self.attentions[attn_index](
+                query, sampling_location = self.attentions[attn_index](
                     query,
                     key,
                     value,
@@ -189,7 +189,7 @@ class BaseTransformerLayer(nn.Module):
                 query = self.ffns[ffn_index](query, identity if self.pre_norm else None)
                 ffn_index += 1
 
-        return query
+        return query, sampling_location
 
 
 class TransformerLayerSequence(nn.Module):
