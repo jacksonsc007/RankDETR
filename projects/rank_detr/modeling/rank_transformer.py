@@ -558,7 +558,7 @@ class RankDetrTransformer(nn.Module):
                     rank_indices=rank_indices,
                     **kwargs
             )
-            encoder_reference_points = encoder_sampling_location
+            encoder_reference_points = encoder_sampling_location.detach()
 
             # assert decoder_reference_points.requires_grad == False
             inter_states.append(decoder_query)
