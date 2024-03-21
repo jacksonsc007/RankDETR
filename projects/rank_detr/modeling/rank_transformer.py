@@ -17,6 +17,7 @@ import copy
 import math
 import torch
 import torch.nn as nn
+import torchvision
 
 from detrex.layers import (
     FFN,
@@ -634,11 +635,39 @@ class RankDetrTransformer(nn.Module):
                 pos_trans_out = self.pos_trans_norm(
                     self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact))
                 )
+                # ================== RoI Feature Generation ===============================
+                # (n_level, 2) -> (n_level, 4)
+                rev_spatial_shapes = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], dim=-1).repeat(1, 2) # hw -> wh
+                roi = decoder_reference_points[:, :, None, :] * rev_spatial_shapes[None, None]
+                num_dec_query = decoder_reference_points.size(1)
+                # roi: (N, num_dec_q, n_levels, 4) . padding scale coordinate
+                n_levels = len(spatial_shapes)
+                N, _, feat_c = memory.shape
+                memory_list = memory.split([H * W for (H, W) in spatial_shapes], dim=1)
+                roi_feature_list = []
+                for lvl in range(n_levels):
+                    mem = memory_list[lvl] # (N, num, feat_c)
+                    roi_per_lvl = roi[:, :, lvl] # (N, num_q, 4)
+                    h, w = spatial_shapes[lvl]
+                    mem_2d = mem.reshape(N, h, w, feat_c).permute(0, 3, 1, 2)
+                    # (N, num_q, feat_c, 7, 7)
+                    roi_feature = torchvision.ops.roi_align(
+                        mem_2d, # (N, feat_c, h, w)
+                        list(torch.unbind(roi_per_lvl, dim=0)),
+                        output_size=(7,7),
+                        spatial_scale=1.0,
+                    ).reshape(N, num_dec_query, feat_c, 7, 7)
+                    # roi_feature = roi_feature.flatten(2, 3).permute(0, 2, 1) # (N * num_q, 49, feat_c)
+                    roi_feature_list.append(roi_feature)
+                # (N, num_q, feat_c)
+                roi_features = torch.stack(roi_feature_list, dim=3).mean(dim=(3, 4, 5)) 
+
                 if not self.mixed_selection:
                     decoder_query_pos, decoder_query = torch.split(pos_trans_out, c, dim=2)
                 else:
                     # decoder_query_pos here is the content embed for deformable DETR
-                    decoder_query = decoder_query_embed.unsqueeze(0).expand(bs, -1, -1)
+                    # decoder_query = decoder_query_embed.unsqueeze(0).expand(bs, -1, -1)
+                    decoder_query = roi_features
                     decoder_query_pos, _ = torch.split(pos_trans_out, c, dim=2)
             else:
                 decoder_query_pos, decoder_query = torch.split(decoder_query_embed, c, dim=1)
