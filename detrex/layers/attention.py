@@ -135,7 +135,7 @@ class MultiheadAttention(nn.Module):
             key_padding_mask=key_padding_mask,
         )[0]
 
-        return identity + self.proj_drop(out), None, None
+        return identity + self.proj_drop(out)
 
 
 class ConditionalSelfAttention(nn.Module):

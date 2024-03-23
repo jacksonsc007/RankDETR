@@ -119,20 +119,15 @@ def multi_scale_deformable_attn_pytorch(
         sampling_grid_l_ = sampling_grids[:, :, :, level].transpose(1, 2).flatten(0, 1)
         # bs*num_heads, embed_dims, num_queries, num_points
         sampling_value_l_ = F.grid_sample(
-            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False # out-of-bounds are set to zero according to padding_mode
+            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
         )
-        sampling_value_list.append(sampling_value_l_)  
+        sampling_value_list.append(sampling_value_l_)
     # (bs, num_queries, num_heads, num_levels, num_points) ->
     # (bs, num_heads, num_queries, num_levels, num_points) ->
-    # (bs * num_heads, 1, num_queries, num_levels*num_points)
+    # (bs, num_heads, 1, num_queries, num_levels*num_points)
     attention_weights = attention_weights.transpose(1, 2).reshape(
         bs * num_heads, 1, num_queries, num_levels * num_points
     )
-    # list of (bs*num_heads, embed_dims, num_queries, num_points) ->
-    # (bs*num_heads, embed_dims, num_queries, num_levels, num_points) ->
-    # (bs*num_heads, embed_dims, num_queries, num_levels * num_points) ->
-    # (bs*num_heads, embed_dims, num_queries) ->
-    # (bs, num_heads * embed_dims, num_queries)
     output = (
         (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights)
         .sum(-1)
@@ -298,12 +293,12 @@ class MultiScaleDeformableAttention(nn.Module):
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
         value = value.view(bs, num_value, self.num_heads, -1)
         # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
-        sampling_offsets = self.sampling_offsets(query).view( #NOTE the way to generate offsets for every head and every query
+        sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
         )
         # [bs, all hw, 8, 16]: 4 level 4 sampling points: 16 features total
-        attention_weights = self.attention_weights(query).view( #NOTE the way to genereate attention weight.
-            bs, num_query, self.num_heads, self.num_levels * self.num_points # we need to normalize attention weight among 4 sampling points for 4 levels.
+        attention_weights = self.attention_weights(query).view(
+            bs, num_query, self.num_heads, self.num_levels * self.num_points
         )
         attention_weights = attention_weights.softmax(-1)
         attention_weights = attention_weights.view(
@@ -323,7 +318,6 @@ class MultiScaleDeformableAttention(nn.Module):
             # references_points + sampling_offsets
             
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
-            # sampling_locations: [N, Len_q, n_heads, n_levels, n_points, 2]
             sampling_locations = (
                 reference_points[:, :, None, :, None, :]
                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
@@ -366,7 +360,7 @@ class MultiScaleDeformableAttention(nn.Module):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return self.dropout(output) + identity, sampling_locations, attention_weights
+        return self.dropout(output) + identity
 
 
 def create_dummy_class(klass, dependency, message=""):

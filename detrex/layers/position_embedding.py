@@ -87,20 +87,20 @@ class PositionEmbeddingSine(nn.Module):
         assert mask is not None
         not_mask = ~mask
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32) # shape (bs, f_H, f_W)
-        if self.normalize: # to get the normalized position 
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if self.normalize:
             y_embed = (y_embed + self.offset) / (y_embed[:, -1:, :] + self.eps) * self.scale
             x_embed = (x_embed + self.offset) / (x_embed[:, :, -1:] + self.eps) * self.scale
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=mask.device)
         dim_t = self.temperature ** (
             2 * torch.div(dim_t, 2, rounding_mode="floor") / self.num_pos_feats
         )
-        pos_x = x_embed[:, :, :, None] / dim_t # shape: (bs, f_H, f_W, 1) / (128) -> (bs, f_H, f_W, 128)
+        pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
 
         # use view as mmdet instead of flatten for dynamically exporting to ONNX
         B, H, W = mask.size()
-        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).view( # sin for even, cos for odd
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).view(
             B, H, W, -1
         )
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).view(
